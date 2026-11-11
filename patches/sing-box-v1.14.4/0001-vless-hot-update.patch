@@ -1,0 +1,345 @@
+diff --git a/protocol/vless/inbound.go b/protocol/vless/inbound.go
+index 80bb10f..b2c0675 100644
+--- a/protocol/vless/inbound.go
++++ b/protocol/vless/inbound.go
+@@ -4,6 +4,7 @@ import (
+ 	"context"
+ 	"net"
+ 	"os"
++	"sync"
+ 
+ 	"github.com/sagernet/sing-box/adapter"
+ 	"github.com/sagernet/sing-box/adapter/inbound"
+@@ -25,6 +26,8 @@ import (
+ 	"github.com/sagernet/sing/common/logger"
+ 	M "github.com/sagernet/sing/common/metadata"
+ 	N "github.com/sagernet/sing/common/network"
++
++	"github.com/gofrs/uuid/v5"
+ )
+ 
+ func RegisterInbound(registry *inbound.Registry) {
+@@ -35,15 +38,15 @@ var _ adapter.TCPInjectableInbound = (*Inbound)(nil)
+ 
+ type Inbound struct {
+ 	inbound.Adapter
+-	ctx        context.Context
+-	router     adapter.ConnectionRouterEx
+-	logger     logger.ContextLogger
+-	listener   *listener.Listener
+-	users      []option.VLESSUser
+-	service    *vless.Service[int]
+-	tlsConfig  tls.ServerConfig
+-	transport  adapter.V2RayServerTransport
+-	references []string
++	ctx           context.Context
++	router        adapter.ConnectionRouterEx
++	logger        logger.ContextLogger
++	listener      *listener.Listener
++	service       *vless.Service[string]
++	serviceAccess sync.RWMutex
++	tlsConfig     tls.ServerConfig
++	transport     adapter.V2RayServerTransport
++	references    []string
+ }
+ 
+ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.VLESSInboundOptions) (adapter.Inbound, error) {
+@@ -52,19 +55,19 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
+ 		ctx:     ctx,
+ 		router:  uot.NewRouter(router, logger),
+ 		logger:  logger,
+-		users:   options.Users,
+ 	}
+ 	var err error
+ 	inbound.router, err = mux.NewRouterWithOptions(inbound.router, logger, common.PtrValueOrDefault(options.Multiplex))
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	service := vless.NewService[int](logger, adapter.NewUpstreamContextHandler(inbound.newConnectionEx, inbound.newPacketConnectionEx))
+-	service.UpdateUsers(common.MapIndexed(inbound.users, func(index int, _ option.VLESSUser) int {
+-		return index
+-	}), common.Map(inbound.users, func(it option.VLESSUser) string {
++	users := withFallbackNames(options.Users)
++	service := vless.NewService[string](logger, adapter.NewUpstreamContextHandler(inbound.newConnectionEx, inbound.newPacketConnectionEx))
++	service.UpdateUsers(common.Map(users, func(it option.VLESSUser) string {
++		return it.Name
++	}), common.Map(users, func(it option.VLESSUser) string {
+ 		return it.UUID
+-	}), common.Map(inbound.users, func(it option.VLESSUser) string {
++	}), common.Map(users, func(it option.VLESSUser) string {
+ 		return it.Flow
+ 	}))
+ 	inbound.service = service
+@@ -150,6 +153,65 @@ func (h *Inbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
+ 	return nil
+ }
+ 
++// withFallbackNames copies the users and gives every unnamed one a reserved
++// index identity. A plain index string would let an explicit name such as "1"
++// collide with the fallback of another user.
++func withFallbackNames(users []option.VLESSUser) []option.VLESSUser {
++	copied := append([]option.VLESSUser(nil), users...)
++	for index := range copied {
++		if copied[index].Name == "" {
++			copied[index].Name = "@index:" + F.ToString(index)
++		}
++	}
++	return copied
++}
++
++// validateVLESSUsers enforces the hot-update contract: a stable name, a parseable
++// UUID and no shared identity, so two members cannot collapse into one entry of
++// the credential table.
++func validateVLESSUsers(users []option.VLESSUser) error {
++	names := make(map[string]struct{}, len(users))
++	// Uniqueness is checked on the parsed 16-byte value, not on the text: the
++	// same UUID written with different case or separators is one credential.
++	uuids := make(map[uuid.UUID]struct{}, len(users))
++	for _, user := range users {
++		if user.Name == "" {
++			return E.New("VLESS hot update requires a stable user name")
++		}
++		parsed, err := uuid.FromString(user.UUID)
++		if err != nil {
++			return E.Cause(err, "VLESS hot update requires a valid user UUID")
++		}
++		if _, loaded := names[user.Name]; loaded {
++			return E.New("VLESS hot update requires unique user names")
++		}
++		if _, loaded := uuids[parsed]; loaded {
++			return E.New("VLESS hot update requires unique user UUIDs")
++		}
++		names[user.Name] = struct{}{}
++		uuids[parsed] = struct{}{}
++	}
++	return nil
++}
++
++func (h *Inbound) UpdateUsers(users []option.VLESSUser) error {
++	if err := validateVLESSUsers(users); err != nil {
++		return err
++	}
++	service := vless.NewService[string](h.logger, adapter.NewUpstreamContextHandler(h.newConnectionEx, h.newPacketConnectionEx))
++	service.UpdateUsers(common.Map(users, func(it option.VLESSUser) string {
++		return it.Name
++	}), common.Map(users, func(it option.VLESSUser) string {
++		return it.UUID
++	}), common.Map(users, func(it option.VLESSUser) string {
++		return it.Flow
++	}))
++	h.serviceAccess.Lock()
++	h.service = service
++	h.serviceAccess.Unlock()
++	return nil
++}
++
+ func (h *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
+ 	if h.tlsConfig != nil && h.transport == nil {
+ 		tlsConn, err := tls.ServerHandshake(ctx, conn, h.tlsConfig)
+@@ -160,7 +222,10 @@ func (h *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
+ 		}
+ 		conn = tlsConn
+ 	}
+-	err := h.service.NewConnection(adapter.WithContext(ctx, &metadata), conn, metadata.Source, onClose)
++	h.serviceAccess.RLock()
++	service := h.service
++	h.serviceAccess.RUnlock()
++	err := service.NewConnection(adapter.WithContext(ctx, &metadata), conn, metadata.Source, onClose)
+ 	if err != nil {
+ 		N.CloseOnHandshakeFailure(conn, onClose, err)
+ 		h.logger.ErrorContext(ctx, E.Cause(err, "process connection from ", metadata.Source))
+@@ -170,17 +235,12 @@ func (h *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
+ func (h *Inbound) newConnectionEx(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
+ 	metadata.Inbound = h.Tag()
+ 	metadata.InboundType = h.Type()
+-	userIndex, loaded := auth.UserFromContext[int](ctx)
++	user, loaded := auth.UserFromContext[string](ctx)
+ 	if !loaded {
+ 		N.CloseOnHandshakeFailure(conn, onClose, os.ErrInvalid)
+ 		return
+ 	}
+-	user := h.users[userIndex].Name
+-	if user == "" {
+-		user = F.ToString(userIndex)
+-	} else {
+-		metadata.User = user
+-	}
++	metadata.User = user
+ 	h.logger.InfoContext(ctx, "[", user, "] inbound connection to ", metadata.Destination)
+ 	h.router.RouteConnectionEx(ctx, conn, metadata, onClose)
+ }
+@@ -188,17 +248,12 @@ func (h *Inbound) newConnectionEx(ctx context.Context, conn net.Conn, metadata a
+ func (h *Inbound) newPacketConnectionEx(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
+ 	metadata.Inbound = h.Tag()
+ 	metadata.InboundType = h.Type()
+-	userIndex, loaded := auth.UserFromContext[int](ctx)
++	user, loaded := auth.UserFromContext[string](ctx)
+ 	if !loaded {
+ 		N.CloseOnHandshakeFailure(conn, onClose, os.ErrInvalid)
+ 		return
+ 	}
+-	user := h.users[userIndex].Name
+-	if user == "" {
+-		user = F.ToString(userIndex)
+-	} else {
+-		metadata.User = user
+-	}
++	metadata.User = user
+ 	if metadata.Destination.Fqdn == packetaddr.SeqPacketMagicAddress {
+ 		metadata.Destination = M.Socksaddr{}
+ 		conn = packetaddr.NewConn(bufio.NewNetPacketConn(conn), metadata.Destination)
+diff --git a/protocol/vless/nanmonee_hot_update_test.go b/protocol/vless/nanmonee_hot_update_test.go
+new file mode 100644
+index 0000000..9c4b63a
+--- /dev/null
++++ b/protocol/vless/nanmonee_hot_update_test.go
+@@ -0,0 +1,149 @@
++package vless
++
++import (
++	"bytes"
++	"context"
++	"net"
++	"testing"
++	"time"
++
++	"github.com/gofrs/uuid/v5"
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/adapter/inbound"
++	"github.com/sagernet/sing-box/log"
++	"github.com/sagernet/sing-box/option"
++	"github.com/sagernet/sing-vmess"
++	protocol "github.com/sagernet/sing-vmess/vless"
++	"github.com/sagernet/sing/common/auth"
++	M "github.com/sagernet/sing/common/metadata"
++	N "github.com/sagernet/sing/common/network"
++)
++
++type userUpdater interface {
++	UpdateUsers(users []option.VLESSUser) error
++}
++
++var _ userUpdater = (*Inbound)(nil)
++
++type identityCaptureRouter struct {
++	user    string
++	started chan struct{}
++	release chan struct{}
++}
++
++func (r *identityCaptureRouter) RouteConnection(context.Context, net.Conn, adapter.InboundContext) error {
++	return nil
++}
++
++func (r *identityCaptureRouter) RoutePacketConnection(context.Context, N.PacketConn, adapter.InboundContext) error {
++	return nil
++}
++
++func (r *identityCaptureRouter) RouteConnectionEx(_ context.Context, _ net.Conn, metadata adapter.InboundContext, _ N.CloseHandlerFunc) {
++	r.user = metadata.User
++	if r.started != nil {
++		close(r.started)
++		<-r.release
++	}
++}
++
++func (r *identityCaptureRouter) RoutePacketConnectionEx(_ context.Context, _ N.PacketConn, metadata adapter.InboundContext, _ N.CloseHandlerFunc) {
++	r.user = metadata.User
++}
++
++func testInbound(t *testing.T) (*Inbound, *identityCaptureRouter) {
++	t.Helper()
++	factory, err := log.New(log.Options{Options: option.LogOptions{Disabled: true}})
++	if err != nil {
++		t.Fatal(err)
++	}
++	router := new(identityCaptureRouter)
++	h := &Inbound{
++		Adapter: inbound.NewAdapter("vless", "test"),
++		router:  router,
++		logger:  factory.NewLogger("test"),
++	}
++	return h, router
++}
++
++func TestAuthenticatedIdentityDoesNotDependOnUserArrayOrder(t *testing.T) {
++	h, router := testInbound(t)
++	const identity = "member-7-generation-3"
++	ctx := auth.ContextWithUser(context.Background(), identity)
++	h.newConnectionEx(ctx, nil, adapter.InboundContext{}, nil)
++	if router.user != identity {
++		t.Fatalf("authenticated identity changed: got %q, want %q", router.user, identity)
++	}
++}
++
++func TestUpdateUsersDoesNotWaitForExistingConnectionHandler(t *testing.T) {
++	h, router := testInbound(t)
++	router.started = make(chan struct{})
++	router.release = make(chan struct{})
++	h.service = protocol.NewService[string](h.logger, adapter.NewUpstreamContextHandler(h.newConnectionEx, h.newPacketConnectionEx))
++	userID, err := uuid.FromString("11111111-1111-4111-8111-111111111111")
++	if err != nil {
++		t.Fatal(err)
++	}
++	h.service.UpdateUsers([]string{"m1.g1"}, []string{userID.String()}, []string{""})
++	var encoded bytes.Buffer
++	err = protocol.WriteRequest(&encoded, protocol.Request{UUID: userID, Command: vmess.CommandTCP, Destination: M.ParseSocksaddr("192.0.2.1:80")}, nil)
++	if err != nil {
++		t.Fatal(err)
++	}
++	client, server := net.Pipe()
++	defer client.Close()
++	defer server.Close()
++	go h.NewConnection(context.Background(), server, adapter.InboundContext{}, nil)
++	if _, err := client.Write(encoded.Bytes()); err != nil {
++		t.Fatal(err)
++	}
++	<-router.started
++
++	updated := make(chan error, 1)
++	go func() {
++		updated <- h.UpdateUsers([]option.VLESSUser{{Name: "m2.g1", UUID: "22222222-2222-4222-8222-222222222222"}})
++	}()
++	select {
++	case err := <-updated:
++		if err != nil {
++			t.Fatal(err)
++		}
++	case <-time.After(time.Second):
++		close(router.release)
++		<-updated
++		t.Fatal("user update waited for an existing connection handler")
++	}
++	close(router.release)
++}
++
++func TestUpdateUsersRejectsAmbiguousCredentials(t *testing.T) {
++	h, _ := testInbound(t)
++	for name, users := range map[string][]option.VLESSUser{
++		"empty name":     {{Name: "", UUID: "11111111-1111-4111-8111-111111111111"}},
++		"invalid uuid":   {{Name: "m1.g1", UUID: "not-a-uuid"}},
++		"duplicate name": {{Name: "m1.g1", UUID: "11111111-1111-4111-8111-111111111111"}, {Name: "m1.g1", UUID: "22222222-2222-4222-8222-222222222222"}},
++		"duplicate uuid": {{Name: "m1.g1", UUID: "11111111-1111-4111-8111-111111111111"}, {Name: "m2.g1", UUID: "11111111-1111-4111-8111-111111111111"}},
++		"duplicate uuid spelled differently": {{Name: "m1.g1", UUID: "11111111-1111-4111-8111-111111111111"}, {Name: "m2.g1", UUID: "11111111111141118111111111111111"}},
++	} {
++		if err := h.UpdateUsers(users); err == nil {
++			t.Fatalf("%s: hot update accepted an ambiguous credential set", name)
++		}
++	}
++	if err := h.UpdateUsers(nil); err != nil {
++		t.Fatalf("an empty authorization must be allowed: %v", err)
++	}
++}
++
++func TestFallbackNamesCannotCollideWithExplicitOnes(t *testing.T) {
++	users := withFallbackNames([]option.VLESSUser{
++		{Name: "1", UUID: "11111111-1111-4111-8111-111111111111"},
++		{Name: "", UUID: "22222222-2222-4222-8222-222222222222"},
++	})
++	if users[0].Name != "1" || users[1].Name != "@index:1" {
++		t.Fatalf("an unnamed user did not get a reserved identity: %v", users)
++	}
++	if users[0].Name == users[1].Name {
++		t.Fatal("a fallback name collided with an explicit name")
++	}
++}

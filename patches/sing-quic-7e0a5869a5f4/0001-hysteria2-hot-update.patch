@@ -1,0 +1,185 @@
+diff --git a/hysteria2/service.go b/hysteria2/service.go
+index cf453d2..94df6e4 100644
+--- a/hysteria2/service.go
++++ b/hysteria2/service.go
+@@ -68,7 +68,10 @@ type Service[U comparable] struct {
+ 	geckoMaxPacketSize    int
+ 	tlsConfig             aTLS.ServerConfig
+ 	quicConfig            *quic.Config
++	userAccess            sync.RWMutex
+ 	userMap               map[string]U
++	sessionAccess         sync.Mutex
++	sessions              map[*serverSession[U]]struct{}
+ 	udpDisabled           bool
+ 	udpTimeout            time.Duration
+ 	handler               ServerHandler
+@@ -139,6 +142,7 @@ func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
+ 		tlsConfig:             options.TLSConfig,
+ 		quicConfig:            quicConfig,
+ 		userMap:               make(map[string]U),
++		sessions:              make(map[*serverSession[U]]struct{}),
+ 		udpDisabled:           options.UDPDisabled,
+ 		udpTimeout:            options.UDPTimeout,
+ 		handler:               options.Handler,
+@@ -153,7 +157,42 @@ func (s *Service[U]) UpdateUsers(userList []U, passwordList []string) {
+ 	for i, user := range userList {
+ 		userMap[passwordList[i]] = user
+ 	}
++	s.userAccess.Lock()
+ 	s.userMap = userMap
++	s.userAccess.Unlock()
++	s.revokeUnauthorized()
++}
++
++// LookupUser resolves a password to the identity that is authorized right now.
++// The map is replaced as a whole, so a reader never observes a partial update.
++func (s *Service[U]) LookupUser(password string) (U, bool) {
++	s.userAccess.RLock()
++	user, loaded := s.userMap[password]
++	s.userAccess.RUnlock()
++	return user, loaded
++}
++
++// An authenticated session owns one credential generation for its lifetime.
++func (s *Service[U]) authorized(password string, user U) bool {
++	current, loaded := s.LookupUser(password)
++	return loaded && current == user
++}
++
++func (s *Service[U]) revokeUnauthorized() {
++	s.sessionAccess.Lock()
++	sessions := make([]*serverSession[U], 0, len(s.sessions))
++	for session := range s.sessions {
++		sessions = append(sessions, session)
++	}
++	s.sessionAccess.Unlock()
++	for _, session := range sessions {
++		session.authAccess.RLock()
++		revoked := session.authenticated && !s.authorized(session.authPassword, session.authUser)
++		session.authAccess.RUnlock()
++		if revoked {
++			session.closeWithError(E.New("user credential revoked"))
++		}
++	}
+ }
+ 
+ func (s *Service[U]) Start(conn net.PacketConn) error {
+@@ -247,12 +286,20 @@ func (s *Service[U]) handleConnection(connection *quic.Conn) {
+ 		connDone:   make(chan struct{}),
+ 		udpConnMap: make(map[uint32]*udpPacketConn),
+ 	}
++	s.sessionAccess.Lock()
++	s.sessions[session] = struct{}{}
++	s.sessionAccess.Unlock()
++	defer func() {
++		s.sessionAccess.Lock()
++		delete(s.sessions, session)
++		s.sessionAccess.Unlock()
++	}()
+ 	httpServer := http3.Server{
+ 		Handler:          session,
+ 		StreamDispatcher: session.dispatchStream,
+ 	}
+ 	_ = httpServer.ServeQUICConn(connection)
+-	_ = connection.CloseWithError(0, "")
++	session.closeWithError(net.ErrClosed)
+ }
+ 
+ type serverSession[U comparable] struct {
+@@ -262,15 +309,34 @@ type serverSession[U comparable] struct {
+ 	connAccess    sync.Mutex
+ 	connDone      chan struct{}
+ 	connErr       error
++	authAccess    sync.RWMutex
+ 	authenticated bool
+ 	authUser      U
++	authPassword  string
+ 	udpAccess     sync.RWMutex
+ 	udpConnMap    map[uint32]*udpPacketConn
+ }
+ 
++// authentication returns the identity bound to this QUIC session. It is written
++// by the handshake request goroutine and read by the stream and datagram
++// goroutines, so every access goes through the lock.
++func (s *serverSession[U]) authentication() (U, bool) {
++	s.authAccess.RLock()
++	defer s.authAccess.RUnlock()
++	return s.authUser, s.authenticated && s.Service.authorized(s.authPassword, s.authUser)
++}
++
+ func (s *serverSession[U]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ 	if r.Method == http.MethodPost && r.Host == protocol.URLHost && r.URL.Path == protocol.URLPath {
++		s.authAccess.Lock()
+ 		if s.authenticated {
++			authorized := s.Service.authorized(s.authPassword, s.authUser)
++			s.authAccess.Unlock()
++			if !authorized {
++				s.closeWithError(E.New("user credential revoked"))
++				s.masqueradeHandler.ServeHTTP(w, r)
++				return
++			}
+ 			protocol.AuthResponseToHeader(w.Header(), protocol.AuthResponse{
+ 				UDPEnabled: !s.udpDisabled,
+ 				Rx:         s.receiveBPS,
+@@ -280,13 +346,16 @@ func (s *serverSession[U]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ 			return
+ 		}
+ 		request := protocol.AuthRequestFromHeader(r.Header)
+-		user, loaded := s.userMap[request.Auth]
++		user, loaded := s.LookupUser(request.Auth)
+ 		if !loaded {
++			s.authAccess.Unlock()
+ 			s.masqueradeHandler.ServeHTTP(w, r)
+ 			return
+ 		}
+ 		s.authUser = user
++		s.authPassword = request.Auth
+ 		s.authenticated = true
++		s.authAccess.Unlock()
+ 		var rxAuto bool
+ 		if s.receiveBPS > 0 && s.ignoreClientBandwidth && request.Rx == 0 {
+ 			s.logger.Debug("process connection from ", r.RemoteAddr, ": BBR disabled by server")
+@@ -329,7 +398,7 @@ func (s *serverSession[U]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ }
+ 
+ func (s *serverSession[U]) dispatchStream(frameType http3.FrameType, stream *quic.Stream, err error) (bool, error) {
+-	if !s.authenticated || err != nil {
++	if _, authenticated := s.authentication(); !authenticated || err != nil {
+ 		return false, nil
+ 	}
+ 	if frameType != protocol.FrameTypeTCPRequest {
+@@ -360,7 +429,11 @@ func (s *serverSession[U]) handleStream(stream *quic.Stream) error {
+ 	if len(destination.Fqdn) > 255 {
+ 		return E.New("fqdn too long")
+ 	}
+-	s.handler.NewConnectionEx(auth.ContextWithUser(s.ctx, s.authUser), &serverConn{Stream: stream}, M.SocksaddrFromNet(s.quicConn.RemoteAddr()).Unwrap(), destination, nil)
++	user, authenticated := s.authentication()
++	if !authenticated {
++		return E.New("session is not authenticated")
++	}
++	s.handler.NewConnectionEx(auth.ContextWithUser(s.ctx, user), &serverConn{Stream: stream}, M.SocksaddrFromNet(s.quicConn.RemoteAddr()).Unwrap(), destination, nil)
+ 	return nil
+ }
+ 
+diff --git a/hysteria2/service_packet.go b/hysteria2/service_packet.go
+index 347c73a..0b26348 100644
+--- a/hysteria2/service_packet.go
++++ b/hysteria2/service_packet.go
+@@ -36,11 +36,16 @@ func (s *serverSession[U]) handleMessage(data []byte) error {
+ 
+ func (s *serverSession[U]) handleUDPMessage(message *udpMessage) {
+ 	sessionID := message.sessionID
++	user, authenticated := s.authentication()
++	if !authenticated {
++		message.releaseMessage()
++		return
++	}
+ 	s.udpAccess.RLock()
+ 	udpConn, loaded := s.udpConnMap[sessionID]
+ 	s.udpAccess.RUnlock()
+ 	if !loaded || common.Done(udpConn.ctx) {
+-		udpConn = newUDPPacketConn(auth.ContextWithUser(s.ctx, s.authUser), s.quicConn, func() {
++		udpConn = newUDPPacketConn(auth.ContextWithUser(s.ctx, user), s.quicConn, func() {
+ 			s.udpAccess.Lock()
+ 			delete(s.udpConnMap, sessionID)
+ 			s.udpAccess.Unlock()

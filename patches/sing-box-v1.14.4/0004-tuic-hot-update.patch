@@ -1,0 +1,252 @@
+diff --git a/protocol/tuic/inbound.go b/protocol/tuic/inbound.go
+index eec5bcb..170c582 100644
+--- a/protocol/tuic/inbound.go
++++ b/protocol/tuic/inbound.go
+@@ -18,6 +18,7 @@ import (
+ 	"github.com/sagernet/sing/common"
+ 	"github.com/sagernet/sing/common/auth"
+ 	E "github.com/sagernet/sing/common/exceptions"
++	F "github.com/sagernet/sing/common/format"
+ 	M "github.com/sagernet/sing/common/metadata"
+ 	N "github.com/sagernet/sing/common/network"
+ 
+@@ -30,12 +31,11 @@ func RegisterInbound(registry *inbound.Registry) {
+ 
+ type Inbound struct {
+ 	inbound.Adapter
+-	router       adapter.ConnectionRouterEx
+-	logger       log.ContextLogger
+-	listener     *listener.Listener
+-	tlsConfig    tls.ServerConfig
+-	server       *tuic.Service[int]
+-	userNameList []string
++	router    adapter.ConnectionRouterEx
++	logger    log.ContextLogger
++	listener  *listener.Listener
++	tlsConfig tls.ServerConfig
++	server    *tuic.Service[string]
+ }
+ 
+ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.TUICInboundOptions) (adapter.Inbound, error) {
+@@ -63,7 +63,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
+ 	} else {
+ 		udpTimeout = C.UDPTimeout
+ 	}
+-	service, err := tuic.NewService[int](tuic.ServiceOptions{
++	service, err := tuic.NewService[string](tuic.ServiceOptions{
+ 		Context:   ctx,
+ 		Logger:    logger,
+ 		TLSConfig: tlsConfig,
+@@ -86,27 +86,89 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	var userList []int
+-	var userNameList []string
+-	var userUUIDList [][16]byte
+-	var userPasswordList []string
+-	for index, user := range options.Users {
+-		if user.UUID == "" {
+-			return nil, E.New("missing uuid for user ", index)
++	userList, userUUIDList, userPasswordList, err := buildTUICUsers(options.Users)
++	if err != nil {
++		return nil, err
++	}
++	service.UpdateUsers(userList, userUUIDList, userPasswordList)
++	inbound.server = service
++	return inbound, nil
++}
++
++// UpdateUsers replaces the accepted credentials without touching the QUIC
++// listener, so established sessions keep running while the identity set changes.
++// The authenticated identity of a session is the user name, never an array
++// index, so reordering the users cannot move a session to another member.
++func (h *Inbound) UpdateUsers(users []option.TUICUser) error {
++	userList, userUUIDList, userPasswordList, err := validateTUICUsers(users)
++	if err != nil {
++		return err
++	}
++	h.server.UpdateUsers(userList, userUUIDList, userPasswordList)
++	return nil
++}
++
++// validateTUICUsers enforces the hot-update contract: every member needs a
++// stable identity, a valid UUID and a password, and neither names nor UUIDs may
++// repeat. The returned lists are index-aligned with the credential table.
++func validateTUICUsers(users []option.TUICUser) ([]string, [][16]byte, []string, error) {
++	names := make(map[string]struct{}, len(users))
++	uuids := make(map[[16]byte]struct{}, len(users))
++	for index, user := range users {
++		if user.Name == "" {
++			return nil, nil, nil, E.New("tuic hot update requires a stable user name")
+ 		}
+-		userUUID, err := uuid.FromString(user.UUID)
++		if user.Password == "" {
++			return nil, nil, nil, E.New("tuic hot update requires a user password")
++		}
++		userUUID, err := parseTUICUserUUID(user, index)
+ 		if err != nil {
+-			return nil, E.Cause(err, "invalid uuid for user ", index)
++			return nil, nil, nil, err
++		}
++		if _, loaded := names[user.Name]; loaded {
++			return nil, nil, nil, E.New("tuic hot update requires unique user names")
+ 		}
+-		userList = append(userList, index)
+-		userNameList = append(userNameList, user.Name)
++		if _, loaded := uuids[userUUID]; loaded {
++			return nil, nil, nil, E.New("tuic hot update requires unique user uuids")
++		}
++		names[user.Name] = struct{}{}
++		uuids[userUUID] = struct{}{}
++	}
++	return buildTUICUsers(users)
++}
++
++// buildTUICUsers prepares the credentials a listener starts with. Startup stays
++// as permissive as it was before hot updates existed: an unnamed user gets a
++// reserved index identity and an empty password is passed through, because only
++// the hot-update path enforces the panel contract.
++func buildTUICUsers(users []option.TUICUser) ([]string, [][16]byte, []string, error) {
++	userList := make([]string, 0, len(users))
++	userUUIDList := make([][16]byte, 0, len(users))
++	userPasswordList := make([]string, 0, len(users))
++	for index, user := range users {
++		if user.Name == "" {
++			user.Name = "@index:" + F.ToString(index)
++		}
++		userUUID, err := parseTUICUserUUID(user, index)
++		if err != nil {
++			return nil, nil, nil, err
++		}
++		userList = append(userList, user.Name)
+ 		userUUIDList = append(userUUIDList, userUUID)
+ 		userPasswordList = append(userPasswordList, user.Password)
+ 	}
+-	service.UpdateUsers(userList, userUUIDList, userPasswordList)
+-	inbound.server = service
+-	inbound.userNameList = userNameList
+-	return inbound, nil
++	return userList, userUUIDList, userPasswordList, nil
++}
++
++func parseTUICUserUUID(user option.TUICUser, index int) ([16]byte, error) {
++	if user.UUID == "" {
++		return [16]byte{}, E.New("missing uuid for user ", index)
++	}
++	userUUID, err := uuid.FromString(user.UUID)
++	if err != nil {
++		return [16]byte{}, E.Cause(err, "invalid uuid for user ", index)
++	}
++	return userUUID, nil
+ }
+ 
+ func (h *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, source M.Socksaddr, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
+@@ -121,8 +183,10 @@ func (h *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, source M.S
+ 	metadata.Source = source
+ 	metadata.Destination = destination
+ 	h.logger.InfoContext(ctx, "inbound connection from ", metadata.Source)
+-	userID, _ := auth.UserFromContext[int](ctx)
+-	if userName := h.userNameList[userID]; userName != "" {
++	// The session carries the authenticated user name. An absent identity is
++	// left empty on purpose: the connection tracker then rejects the stream.
++	userName, _ := auth.UserFromContext[string](ctx)
++	if userName != "" {
+ 		metadata.User = userName
+ 		h.logger.InfoContext(ctx, "[", userName, "] inbound connection to ", metadata.Destination)
+ 	} else {
+@@ -143,8 +207,8 @@ func (h *Inbound) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn,
+ 	metadata.Source = source
+ 	metadata.Destination = destination
+ 	h.logger.InfoContext(ctx, "inbound packet connection from ", metadata.Source)
+-	userID, _ := auth.UserFromContext[int](ctx)
+-	if userName := h.userNameList[userID]; userName != "" {
++	userName, _ := auth.UserFromContext[string](ctx)
++	if userName != "" {
+ 		metadata.User = userName
+ 		h.logger.InfoContext(ctx, "[", userName, "] inbound packet connection to ", metadata.Destination)
+ 	} else {
+diff --git a/protocol/tuic/nanmonee_hot_update_test.go b/protocol/tuic/nanmonee_hot_update_test.go
+new file mode 100644
+index 0000000..95659e9
+--- /dev/null
++++ b/protocol/tuic/nanmonee_hot_update_test.go
+@@ -0,0 +1,78 @@
++package tuic
++
++import (
++	"testing"
++
++	"github.com/gofrs/uuid/v5"
++	"github.com/sagernet/sing-box/option"
++)
++
++// The hot-update contract is what protects a running node from a malformed
++// snapshot: a missing identity, an invalid UUID, or a duplicate key must fail
++// before the credential table is replaced.
++func TestValidateTUICUsersAcceptsStableIdentities(t *testing.T) {
++	users := []option.TUICUser{
++		{Name: "m2.g1", UUID: "22222222-2222-4222-8222-222222222222", Password: "22222222-2222-4222-8222-222222222222"},
++		{Name: "m1.g1", UUID: "11111111-1111-4111-8111-111111111111", Password: "11111111-1111-4111-8111-111111111111"},
++	}
++	names, uuids, passwords, err := validateTUICUsers(users)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(names) != 2 || names[0] != "m2.g1" || names[1] != "m1.g1" {
++		t.Fatalf("names were reordered or lost: %v", names)
++	}
++	if passwords[0] != users[0].Password || uuid.UUID(uuids[1]).String() != users[1].UUID {
++		t.Fatal("credentials were not kept index-aligned with the names")
++	}
++}
++
++func TestValidateTUICUsersRejectsBrokenSnapshots(t *testing.T) {
++	valid := option.TUICUser{Name: "m1.g1", UUID: "11111111-1111-4111-8111-111111111111", Password: "11111111-1111-4111-8111-111111111111"}
++	for name, users := range map[string][]option.TUICUser{
++		"empty name":     {{UUID: valid.UUID, Password: valid.Password}},
++		"empty uuid":     {{Name: valid.Name, Password: valid.Password}},
++		"invalid uuid":   {{Name: valid.Name, UUID: "not-a-uuid", Password: valid.Password}},
++		"empty password": {{Name: valid.Name, UUID: valid.UUID}},
++		"duplicate name": {valid, {Name: valid.Name, UUID: "22222222-2222-4222-8222-222222222222", Password: "x"}},
++		"duplicate uuid": {valid, {Name: "m2.g1", UUID: valid.UUID, Password: "x"}},
++	} {
++		users := users
++		t.Run(name, func(t *testing.T) {
++			if _, _, _, err := validateTUICUsers(users); err == nil {
++				t.Fatalf("broken snapshot %q was accepted", name)
++			}
++		})
++	}
++}
++
++// A listener that is started from a file still accepts unnamed users and empty
++// passwords; only the hot-update path enforces the panel contract.
++func TestBuildTUICUsersKeepsStartupPermissive(t *testing.T) {
++	input := []option.TUICUser{
++		{UUID: "11111111-1111-4111-8111-111111111111"},
++		{Name: "1", UUID: "22222222-2222-4222-8222-222222222222"},
++	}
++	names, uuids, passwords, err := buildTUICUsers(input)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(names) != 2 || names[0] != "@index:0" || names[1] != "1" {
++		t.Fatalf("startup naming regressed: %v", names)
++	}
++	if names[0] == names[1] {
++		t.Fatal("a fallback name collided with an explicit name")
++	}
++	if passwords[0] != "" || passwords[1] != "" {
++		t.Fatalf("an empty password must be accepted at startup: %v", passwords)
++	}
++	if uuid.UUID(uuids[0]).String() != "11111111-1111-4111-8111-111111111111" {
++		t.Fatalf("the uuid list is not index aligned: %v", uuids)
++	}
++	if input[0].Name != "" {
++		t.Fatal("buildTUICUsers mutated the caller's slice")
++	}
++	if _, _, _, err := buildTUICUsers([]option.TUICUser{{Name: "m1.g1", UUID: "", Password: "x"}}); err == nil {
++		t.Fatal("startup must still reject a missing uuid")
++	}
++}

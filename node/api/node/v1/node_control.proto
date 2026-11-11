@@ -1,0 +1,118 @@
+syntax = "proto3";
+
+package nanmonee.node.v1;
+
+option go_package = "nanmonee/node/api/node/v1;nodev1";
+
+service NodeControl {
+  rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
+  rpc ApplySnapshot(ApplySnapshotRequest) returns (ApplySnapshotResponse);
+  rpc GetUsageSnapshot(GetUsageSnapshotRequest) returns (GetUsageSnapshotResponse);
+}
+
+message GetStatusRequest {}
+
+message GetStatusResponse {
+  Status status = 1;
+}
+
+message ApplySnapshotRequest {
+  string expected_runtime_id = 1;
+  uint64 expected_state_revision = 2;
+  NodeConfig config = 3;
+  UserSnapshot users = 4;
+}
+
+message ApplySnapshotResponse {
+  Status status = 1;
+}
+
+message GetUsageSnapshotRequest {}
+
+message GetUsageSnapshotResponse {
+  string runtime_id = 1;
+  repeated MemberUsage usage = 2;
+}
+
+// NodeConfig is the self-managed control plane payload. It carries only the
+// protocols this API was built for; panel-owned nodes receive their inbound
+// from the panel snapshot and support VLESS, Hysteria2, AnyTLS and TUIC alike.
+// AnyTLS and TUIC inbound changes are therefore not part of this message.
+message NodeConfig {
+  oneof protocol {
+    VlessConfig vless = 1;
+    Hysteria2Config hysteria2 = 2;
+  }
+}
+
+message VlessConfig {
+  string listen = 1;
+  uint32 port = 2;
+  string server_name = 3;
+  string handshake_server = 4;
+  uint32 handshake_port = 5;
+  string reality_private_key = 6;
+  string reality_short_id = 7;
+}
+
+// Hysteria2Config carries only the absolute certificate paths; the private key
+// is read from disk by the kernel and never part of a snapshot payload.
+message Hysteria2Config {
+  string listen = 1;
+  uint32 port = 2;
+  string server_name = 3;
+  string certificate_path = 4;
+  string private_key_path = 5;
+}
+
+message UserSnapshot {
+  repeated User users = 1;
+}
+
+message User {
+  int64 member_id = 1;
+  string uuid = 2;
+}
+
+message Status {
+  string agent_version = 1;
+  string api_version = 2;
+  string core_version = 3;
+  string core_commit = 4;
+  repeated string supported_protocols = 5;
+  RuntimeState state = 6;
+  string runtime_id = 7;
+  uint64 state_revision = 8;
+  string config_sha256 = 9;
+  string authorization_sha256 = 10;
+  string last_error = 11;
+  // Panel-owned nodes let the worker write; external applies are refused.
+  bool panel_owned = 12;
+  bool configured = 13;
+  PanelObservation panel = 14;
+  // Active inbound protocol: "vless" or "hysteria2".
+  string protocol = 15;
+}
+
+message PanelObservation {
+  string host = 1;
+  int64 last_pull_unix = 2;
+  int64 last_push_unix = 3;
+  bool rejected = 4;
+  int32 pending_batches = 5;
+  int32 pending_members = 6;
+  string last_error = 7;
+}
+
+enum RuntimeState {
+  RUNTIME_STATE_UNSPECIFIED = 0;
+  RUNTIME_STATE_EMPTY = 1;
+  RUNTIME_STATE_RUNNING = 2;
+  RUNTIME_STATE_DEGRADED = 3;
+}
+
+message MemberUsage {
+  int64 member_id = 1;
+  int64 upload = 2;
+  int64 download = 3;
+}

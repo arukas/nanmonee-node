@@ -1,0 +1,255 @@
+diff --git a/service.go b/service.go
+index bf8caf7..3e3a63c 100644
+--- a/service.go
++++ b/service.go
+@@ -31,7 +31,12 @@ type Service struct {
+ 	sessionAccess   sync.Mutex
+ 	// sessions maps an established server session to the password hash that
+ 	// authenticated it, so a later user update can close exactly the revoked ones.
+-	sessions map[*session.Session][32]byte
++	sessions map[*session.Session]sessionCredential
++}
++
++type sessionCredential struct {
++	password [32]byte
++	name     string
+ }
+ 
+ type ServiceConfig struct {
+@@ -53,7 +58,7 @@ func NewService(config ServiceConfig) (*Service, error) {
+ 		fallbackHandler: config.FallbackHandler,
+ 		logger:          config.Logger,
+ 		users:           make(map[[32]byte]string),
+-		sessions:        make(map[*session.Session][32]byte),
++		sessions:        make(map[*session.Session]sessionCredential),
+ 	}
+ 
+ 	if service.handler == nil || service.logger == nil {
+@@ -92,19 +97,19 @@ func (s *Service) LookupUser(passwordSha256 [32]byte) (string, bool) {
+ 	return user, loaded
+ }
+ 
+-func (s *Service) authorized(passwordSha256 [32]byte) bool {
+-	_, loaded := s.LookupUser(passwordSha256)
+-	return loaded
++func (s *Service) authorized(passwordSha256 [32]byte, name string) bool {
++	current, loaded := s.LookupUser(passwordSha256)
++	return loaded && current == name
+ }
+ 
+ // registerSession publishes a session before it starts receiving streams. A
+ // credential that was revoked between the handshake and this point is refused
+ // immediately instead of being admitted by a stale table read.
+-func (s *Service) registerSession(serverSession *session.Session, passwordSha256 [32]byte) bool {
++func (s *Service) registerSession(serverSession *session.Session, passwordSha256 [32]byte, name string) bool {
+ 	s.sessionAccess.Lock()
+-	s.sessions[serverSession] = passwordSha256
++	s.sessions[serverSession] = sessionCredential{passwordSha256, name}
+ 	s.sessionAccess.Unlock()
+-	if !s.authorized(passwordSha256) {
++	if !s.authorized(passwordSha256, name) {
+ 		_ = serverSession.Close()
+ 		return false
+ 	}
+@@ -122,8 +127,8 @@ func (s *Service) unregisterSession(serverSession *session.Session) {
+ func (s *Service) revokeUnauthorized() {
+ 	s.sessionAccess.Lock()
+ 	stale := make([]*session.Session, 0, len(s.sessions))
+-	for serverSession, passwordSha256 := range s.sessions {
+-		if !s.authorized(passwordSha256) {
++	for serverSession, credential := range s.sessions {
++		if !s.authorized(credential.password, credential.name) {
+ 			stale = append(stale, serverSession)
+ 		}
+ 	}
+@@ -183,9 +188,9 @@ func (s *Service) NewConnection(ctx context.Context, conn net.Conn, source M.Soc
+ 	}, &s.padding, s.logger)
+ 	// Re-check the credential for every new stream: closing a session and a
+ 	// concurrent stream creation may otherwise interleave.
+-	serverSession.SetAuthorization(func() bool { return s.authorized(passwordSha256) })
++	serverSession.SetAuthorization(func() bool { return s.authorized(passwordSha256, userName) })
+ 	serverSession.SetCloseHook(func() { s.unregisterSession(serverSession) })
+-	if !s.registerSession(serverSession, passwordSha256) {
++	if !s.registerSession(serverSession, passwordSha256, userName) {
+ 		return nil
+ 	}
+ 	serverSession.Run()
+diff --git a/service_test.go b/service_test.go
+index 89828eb..29a5522 100644
+--- a/service_test.go
++++ b/service_test.go
+@@ -56,7 +56,7 @@ func TestUpdateUsersClosesRevokedSession(t *testing.T) {
+ 	service := newTestService(t, []User{{Name: "m1.g1", Password: "password-1"}})
+ 	serverSession := newTestSession(t, service)
+ 	serverSession.SetCloseHook(func() { service.unregisterSession(serverSession) })
+-	if !service.registerSession(serverSession, hashOf("password-1")) {
++	if !service.registerSession(serverSession, hashOf("password-1"), "m1.g1") {
+ 		t.Fatal("an authorized credential was refused")
+ 	}
+ 	if service.registeredSessions() != 1 {
+@@ -82,14 +82,14 @@ func TestUpdateUsersKeepsAuthorizedSession(t *testing.T) {
+ 	service := newTestService(t, []User{{Name: "m1.g1", Password: "password-1"}})
+ 	serverSession := newTestSession(t, service)
+ 	serverSession.SetCloseHook(func() { service.unregisterSession(serverSession) })
+-	if !service.registerSession(serverSession, hashOf("password-1")) {
++	if !service.registerSession(serverSession, hashOf("password-1"), "m1.g1") {
+ 		t.Fatal("an authorized credential was refused")
+ 	}
+-	service.UpdateUsers([]User{{Name: "m1.g2", Password: "password-1"}})
++	service.UpdateUsers([]User{{Name: "m1.g1", Password: "password-1"}})
+ 	if serverSession.IsClosed() {
+ 		t.Fatal("a session whose credential survived the update must keep running")
+ 	}
+-	if user, loaded := service.LookupUser(hashOf("password-1")); !loaded || user != "m1.g2" {
++	if user, loaded := service.LookupUser(hashOf("password-1")); !loaded || user != "m1.g1" {
+ 		t.Fatalf("identity was not replaced: %q %v", user, loaded)
+ 	}
+ }
+@@ -98,7 +98,7 @@ func TestRegisterSessionRefusesRevokedCredential(t *testing.T) {
+ 	service := newTestService(t, nil)
+ 	serverSession := newTestSession(t, service)
+ 	serverSession.SetCloseHook(func() { service.unregisterSession(serverSession) })
+-	if service.registerSession(serverSession, hashOf("password-1")) {
++	if service.registerSession(serverSession, hashOf("password-1"), "m1.g1") {
+ 		t.Fatal("an unknown credential was registered")
+ 	}
+ 	if !serverSession.IsClosed() {
+@@ -113,7 +113,7 @@ func TestUpdateUsersAndLookupAreRaceFree(t *testing.T) {
+ 	service := newTestService(t, []User{{Name: "m1.g1", Password: "password-1"}})
+ 	serverSession := newTestSession(t, service)
+ 	serverSession.SetCloseHook(func() { service.unregisterSession(serverSession) })
+-	service.registerSession(serverSession, hashOf("password-1"))
++	service.registerSession(serverSession, hashOf("password-1"), "m1.g1")
+ 
+ 	var wait sync.WaitGroup
+ 	for index := 0; index < 8; index++ {
+@@ -131,3 +131,25 @@ func TestUpdateUsersAndLookupAreRaceFree(t *testing.T) {
+ 	}
+ 	wait.Wait()
+ }
++
++func TestUpdateUsersClosesSessionWhoseIdentityChanged(t *testing.T) {
++	service := newTestService(t, []User{{Name: "m1.g1", Password: "password-1"}})
++	serverSession := newTestSession(t, service)
++	serverSession.SetCloseHook(func() { service.unregisterSession(serverSession) })
++	if !service.registerSession(serverSession, hashOf("password-1"), "m1.g1") {
++		t.Fatal("an authorized credential was refused")
++	}
++	service.UpdateUsers([]User{{Name: "m2.g1", Password: "password-1"}})
++	if !serverSession.IsClosed() {
++		t.Fatal("a session bound to the old identity survived credential reassignment")
++	}
++}
++
++func TestRegistrationRefusesAStaleIdentityWithTheSamePassword(t *testing.T) {
++	service := newTestService(t, []User{{Name: "m2.g1", Password: "password-1"}})
++	serverSession := newTestSession(t, service)
++	serverSession.SetCloseHook(func() { service.unregisterSession(serverSession) })
++	if service.registerSession(serverSession, hashOf("password-1"), "m1.g1") || !serverSession.IsClosed() {
++		t.Fatal("registration accepted an identity from before the credential update")
++	}
++}
+diff --git a/session/session.go b/session/session.go
+index 7d29825..4dc7744 100644
+--- a/session/session.go
++++ b/session/session.go
+@@ -29,6 +29,7 @@ type Session struct {
+ 	dieOnce       sync.Once
+ 	die           chan struct{}
+ 	dieHookAccess sync.Mutex
++	dieHookOnce   sync.Once
+ 	dieHook       func()
+ 
+ 	synDone     func()
+@@ -109,6 +110,9 @@ func (s *Session) SetCloseHook(hook func()) {
+ 	s.dieHookAccess.Lock()
+ 	s.dieHook = hook
+ 	s.dieHookAccess.Unlock()
++	if s.IsClosed() {
++		s.runDieHook()
++	}
+ }
+ 
+ func (s *Session) runDieHook() {
+@@ -117,7 +121,7 @@ func (s *Session) runDieHook() {
+ 	s.dieHook = nil
+ 	s.dieHookAccess.Unlock()
+ 	if hook != nil {
+-		hook()
++		s.dieHookOnce.Do(hook)
+ 	}
+ }
+ 
+diff --git a/session/stream.go b/session/stream.go
+index 315e9b3..ac452d4 100644
+--- a/session/stream.go
++++ b/session/stream.go
+@@ -23,6 +23,7 @@ type Stream struct {
+ 
+ 	dieOnce       sync.Once
+ 	dieHookAccess sync.Mutex
++	dieHookOnce   sync.Once
+ 	dieHook       func()
+ 	// dieErr is written by whichever goroutine closes the stream first and read
+ 	// by the routed side, so it must be accessed atomically. A revocation closes
+@@ -91,6 +92,9 @@ func (s *Stream) setDieHook(hook func()) {
+ 	s.dieHookAccess.Lock()
+ 	s.dieHook = hook
+ 	s.dieHookAccess.Unlock()
++	if s.dieErr.Load() != nil {
++		s.runDieHook()
++	}
+ }
+ 
+ func (s *Stream) runDieHook() {
+@@ -99,7 +103,7 @@ func (s *Stream) runDieHook() {
+ 	s.dieHook = nil
+ 	s.dieHookAccess.Unlock()
+ 	if hook != nil {
+-		hook()
++		s.dieHookOnce.Do(hook)
+ 	}
+ }
+ 
+diff --git a/session/hook_test.go b/session/hook_test.go
+index 546728e..7569ef2 100644
+--- a/session/hook_test.go
++++ b/session/hook_test.go
+@@ -1,6 +1,7 @@
+ package session
+ 
+ import (
++	"net"
+ 	"sync"
+ 	"sync/atomic"
+ 	"testing"
+@@ -29,3 +30,29 @@ func TestStreamDieHookIsInstalledOnce(t *testing.T) {
+ 		t.Fatalf("the hook ran more than once: %d", calls.Load())
+ 	}
+ }
++
++func TestStreamHookInstalledAfterCloseRunsOnce(t *testing.T) {
++	stream := newStream(1, nil)
++	stream.closeLocally()
++	var calls atomic.Int32
++	for i := 0; i < 2; i++ {
++		stream.setDieHook(func() { calls.Add(1) })
++	}
++	if calls.Load() != 1 {
++		t.Fatalf("late stream hook calls = %d, want 1", calls.Load())
++	}
++}
++
++func TestSessionHookInstalledAfterCloseRunsOnce(t *testing.T) {
++	client, server := net.Pipe()
++	defer client.Close()
++	session := &Session{conn: server, die: make(chan struct{}), streams: make(map[uint32]*Stream)}
++	_ = session.Close()
++	var calls atomic.Int32
++	for i := 0; i < 2; i++ {
++		session.SetCloseHook(func() { calls.Add(1) })
++	}
++	if calls.Load() != 1 {
++		t.Fatalf("late session hook calls = %d, want 1", calls.Load())
++	}
++}

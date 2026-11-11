@@ -1,0 +1,405 @@
+diff --git a/tuic/service.go b/tuic/service.go
+index d4535e7..e64898f 100644
+--- a/tuic/service.go
++++ b/tuic/service.go
+@@ -50,8 +50,11 @@ type Service[U comparable] struct {
+ 	tlsConfig         aTLS.ServerConfig
+ 	heartbeat         time.Duration
+ 	quicConfig        *quic.Config
++	userAccess        sync.RWMutex
+ 	userMap           map[[16]byte]U
+ 	passwordMap       map[U]string
++	sessionAccess     sync.Mutex
++	sessions          map[*serverSession[U]]struct{}
+ 	congestionControl string
+ 	authTimeout       time.Duration
+ 	udpTimeout        time.Duration
+@@ -90,6 +93,7 @@ func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
+ 		heartbeat:         options.Heartbeat,
+ 		quicConfig:        quicConfig,
+ 		userMap:           make(map[[16]byte]U),
++		sessions:          make(map[*serverSession[U]]struct{}),
+ 		congestionControl: options.CongestionControl,
+ 		authTimeout:       options.AuthTimeout,
+ 		udpTimeout:        options.UDPTimeout,
+@@ -97,6 +101,9 @@ func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
+ 	}, nil
+ }
+ 
++// UpdateUsers replaces the credential tables as a whole and then closes the
++// sessions whose identity is no longer authorized. The listener and every other
++// session keep running, so a credential change never restarts the node.
+ func (s *Service[U]) UpdateUsers(userList []U, uuidList [][16]byte, passwordList []string) {
+ 	userMap := make(map[[16]byte]U)
+ 	passwordMap := make(map[U]string)
+@@ -104,8 +111,63 @@ func (s *Service[U]) UpdateUsers(userList []U, uuidList [][16]byte, passwordList
+ 		userMap[uuidList[index]] = userList[index]
+ 		passwordMap[userList[index]] = passwordList[index]
+ 	}
++	s.userAccess.Lock()
+ 	s.userMap = userMap
+ 	s.passwordMap = passwordMap
++	s.userAccess.Unlock()
++	s.revokeUnauthorized()
++}
++
++// LookupUser resolves a UUID to the identity and password authorized right now.
++// The maps are replaced as a whole, so a reader never observes a partial update.
++func (s *Service[U]) LookupUser(userUUID [16]byte) (U, string, bool) {
++	s.userAccess.RLock()
++	defer s.userAccess.RUnlock()
++	user, loaded := s.userMap[userUUID]
++	if !loaded {
++		var zero U
++		return zero, "", false
++	}
++	return user, s.passwordMap[user], true
++}
++
++// authorized reports whether the identity still owns the same UUID credential.
++// A re-added member gets a new generation, so the old session fails this check
++// even though the UUID value is unchanged.
++func (s *Service[U]) authorized(userUUID [16]byte, user U) bool {
++	s.userAccess.RLock()
++	defer s.userAccess.RUnlock()
++	current, loaded := s.userMap[userUUID]
++	return loaded && current == user
++}
++
++func (s *Service[U]) registerSession(session *serverSession[U]) {
++	s.sessionAccess.Lock()
++	s.sessions[session] = struct{}{}
++	s.sessionAccess.Unlock()
++}
++
++func (s *Service[U]) unregisterSession(session *serverSession[U]) {
++	s.sessionAccess.Lock()
++	delete(s.sessions, session)
++	s.sessionAccess.Unlock()
++}
++
++// revokeUnauthorized closes every session whose credential disappeared. Closing
++// the QUIC connection also tears down its streams and native UDP associations,
++// so a revoked member cannot keep using an already authenticated session.
++func (s *Service[U]) revokeUnauthorized() {
++	s.sessionAccess.Lock()
++	sessions := make([]*serverSession[U], 0, len(s.sessions))
++	for session := range s.sessions {
++		sessions = append(sessions, session)
++	}
++	s.sessionAccess.Unlock()
++	for _, session := range sessions {
++		if session.revocable() {
++			session.closeWithError(E.New("user credential revoked"))
++		}
++	}
+ }
+ 
+ func (s *Service[U]) Start(conn net.PacketConn) error {
+@@ -169,24 +231,69 @@ func (s *Service[U]) handleConnection(connection *quic.Conn) {
+ 		authDone:   make(chan struct{}),
+ 		udpConnMap: make(map[uint16]*udpPacketConn),
+ 	}
++	// Register around the whole session lifetime: handle only starts the
++	// goroutines below and returns, so a deferred unregister there would drop the
++	// entry before revokeUnauthorized could ever see it.
++	s.registerSession(session)
++	defer s.unregisterSession(session)
+ 	session.handle()
++	<-session.connDone
+ }
+ 
+ type serverSession[U comparable] struct {
+ 	*Service[U]
+-	ctx        context.Context
+-	quicConn   *quic.Conn
+-	connAccess sync.Mutex
+-	connDone   chan struct{}
+-	connErr    error
+-	authAccess sync.Mutex
+-	authDone   chan struct{}
+-	authUser   U
+-	udpAccess  sync.RWMutex
+-	udpConnMap map[uint16]*udpPacketConn
++	ctx           context.Context
++	quicConn      *quic.Conn
++	connAccess    sync.Mutex
++	connDone      chan struct{}
++	connErr       error
++	authAccess    sync.RWMutex
++	authDone      chan struct{}
++	authUUID      [16]byte
++	authUser      U
++	authenticated bool
++	udpAccess     sync.RWMutex
++	udpConnMap    map[uint16]*udpPacketConn
++}
++
++// authentication returns the identity bound to this QUIC session. It is written
++// by the authentication uni stream and read by the stream and datagram
++// goroutines, so every access goes through the lock.
++func (s *serverSession[U]) authentication() (U, bool) {
++	s.authAccess.RLock()
++	defer s.authAccess.RUnlock()
++	return s.authUser, s.authenticated
++}
++
++// revocable reports whether this session holds a credential that has since been
++// removed. A handshake that has not authenticated yet has nothing to revoke;
++// LookupUser judges it against the live table when it does authenticate.
++func (s *serverSession[U]) revocable() bool {
++	if _, authenticated := s.authentication(); !authenticated {
++		return false
++	}
++	return !s.authorized()
++}
++
++// authorized reports whether this session's identity is still in the current
++// credential table. Revocation closes the whole session, so this is the second
++// line of defence for a stream that races with the update.
++func (s *serverSession[U]) authorized() bool {
++	s.authAccess.RLock()
++	defer s.authAccess.RUnlock()
++	return s.authenticated && s.Service.authorized(s.authUUID, s.authUser)
+ }
+ 
+ func (s *serverSession[U]) handle() {
++	// Every termination reason, including a peer close or idle timeout, has to
++	// release the registered session; closeConn is silent about normal disconnects.
++	go func() {
++		select {
++		case <-s.quicConn.Context().Done():
++			s.closeConn(E.New("connection closed"))
++		case <-s.connDone:
++		}
++	}()
+ 	if s.ctx.Done() != nil {
+ 		go func() {
+ 			select {
+@@ -241,12 +348,12 @@ func (s *serverSession[U]) handleUniStream(stream *quic.ReceiveStream) error {
+ 		}
+ 		var userUUID [16]byte
+ 		copy(userUUID[:], buffer.Range(2, 2+16))
+-		user, loaded := s.userMap[userUUID]
++		user, password, loaded := s.LookupUser(userUUID)
+ 		if !loaded {
+ 			return E.New("authentication: unknown user ", uuid.UUID(userUUID))
+ 		}
+ 		handshakeState := s.quicConn.ConnectionState()
+-		tuicToken, err := handshakeState.TLS.ExportKeyingMaterial(string(userUUID[:]), []byte(s.passwordMap[user]), 32)
++		tuicToken, err := handshakeState.TLS.ExportKeyingMaterial(string(userUUID[:]), []byte(password), 32)
+ 		if err != nil {
+ 			return E.Cause(err, "authentication: export keying material")
+ 		}
+@@ -260,7 +367,9 @@ func (s *serverSession[U]) handleUniStream(stream *quic.ReceiveStream) error {
+ 			return E.New("authentication: multiple authentication requests")
+ 		default:
+ 		}
++		s.authUUID = userUUID
+ 		s.authUser = user
++		s.authenticated = true
+ 		close(s.authDone)
+ 		return nil
+ 	case CommandPacket:
+@@ -269,6 +378,9 @@ func (s *serverSession[U]) handleUniStream(stream *quic.ReceiveStream) error {
+ 			return s.connErr
+ 		case <-s.authDone:
+ 		}
++		if !s.authorized() {
++			return E.New("authentication: user credential revoked")
++		}
+ 		message := allocMessage()
+ 		err = readUDPMessage(message, io.MultiReader(bytes.NewReader(buffer.From(2)), stream))
+ 		if err != nil {
+@@ -356,6 +468,10 @@ func (s *serverSession[U]) handleStream(stream *quic.Stream) error {
+ 		return s.connErr
+ 	case <-s.authDone:
+ 	}
++	user, authenticated := s.authentication()
++	if !authenticated || !s.authorized() {
++		return E.New("authentication: user credential revoked")
++	}
+ 	var conn net.Conn = &serverConn{
+ 		Stream:      stream,
+ 		destination: destination,
+@@ -363,7 +479,7 @@ func (s *serverSession[U]) handleStream(stream *quic.Stream) error {
+ 	if !buffer.IsEmpty() {
+ 		conn = bufio.NewCachedConn(conn, buffer.ToOwned())
+ 	}
+-	s.handler.NewConnectionEx(auth.ContextWithUser(s.ctx, s.authUser), conn, M.SocksaddrFromNet(s.quicConn.RemoteAddr()).Unwrap(), destination, nil)
++	s.handler.NewConnectionEx(auth.ContextWithUser(s.ctx, user), conn, M.SocksaddrFromNet(s.quicConn.RemoteAddr()).Unwrap(), destination, nil)
+ 	return nil
+ }
+ 
+@@ -384,20 +500,29 @@ func (s *serverSession[U]) loopHeartbeats() {
+ }
+ 
+ func (s *serverSession[U]) closeWithError(err error) {
+-	s.connAccess.Lock()
+-	defer s.connAccess.Unlock()
+-	select {
+-	case <-s.connDone:
++	if !s.closeConn(err) {
+ 		return
+-	default:
+-		s.connErr = err
+-		close(s.connDone)
+ 	}
+ 	if E.IsClosedOrCanceled(err) {
+ 		s.logger.Debug(E.Cause(err, "connection failed"))
+ 	} else {
+ 		s.logger.Error(E.Cause(err, "connection failed"))
+ 	}
++}
++
++// closeConn closes the session exactly once, records the reason and releases the
++// UDP associations. It reports whether this call performed the close.
++func (s *serverSession[U]) closeConn(err error) bool {
++	s.connAccess.Lock()
++	select {
++	case <-s.connDone:
++		s.connAccess.Unlock()
++		return false
++	default:
++		s.connErr = err
++		close(s.connDone)
++	}
++	s.connAccess.Unlock()
+ 	s.udpAccess.Lock()
+ 	udpConnMap := s.udpConnMap
+ 	s.udpConnMap = make(map[uint16]*udpPacketConn)
+@@ -406,6 +531,7 @@ func (s *serverSession[U]) closeWithError(err error) {
+ 		udpConn.closeWithError(err)
+ 	}
+ 	_ = s.quicConn.CloseWithError(0, "")
++	return true
+ }
+ 
+ type serverConn struct {
+diff --git a/tuic/service_packet.go b/tuic/service_packet.go
+index ec9112d..3c79f59 100644
+--- a/tuic/service_packet.go
++++ b/tuic/service_packet.go
+@@ -58,7 +58,8 @@ func (s *serverSession[U]) handleUDPMessage(message *udpMessage, udpStream bool)
+ 	udpConn, loaded := s.udpConnMap[sessionID]
+ 	s.udpAccess.RUnlock()
+ 	if !loaded || common.Done(udpConn.ctx) {
+-		udpConn = newUDPPacketConn(auth.ContextWithUser(s.ctx, s.authUser), s.quicConn, udpStream, true, func() {
++		user, _ := s.authentication()
++		udpConn = newUDPPacketConn(auth.ContextWithUser(s.ctx, user), s.quicConn, udpStream, true, func() {
+ 			s.udpAccess.Lock()
+ 			delete(s.udpConnMap, sessionID)
+ 			s.udpAccess.Unlock()
+diff --git a/tuic/service_test.go b/tuic/service_test.go
+new file mode 100644
+index 0000000..597fe68
+--- /dev/null
++++ b/tuic/service_test.go
+@@ -0,0 +1,107 @@
++package tuic
++
++import (
++	"context"
++	"testing"
++
++	"github.com/sagernet/sing/common/logger"
++)
++
++func newTestService(t *testing.T) *Service[string] {
++	t.Helper()
++	service, err := NewService[string](ServiceOptions{Context: context.Background(), Logger: logger.NOP()})
++	if err != nil {
++		t.Fatal(err)
++	}
++	return service
++}
++
++func testUUID(value byte) [16]byte {
++	var id [16]byte
++	for index := range id {
++		id[index] = value
++	}
++	return id
++}
++
++// A credential update replaces both tables as a whole, and a removed member
++// stops resolving immediately even when another member keeps the same index.
++func TestUpdateUsersReplacesCredentialTables(t *testing.T) {
++	service := newTestService(t)
++	first, second := testUUID(1), testUUID(2)
++	service.UpdateUsers([]string{"m1.g1", "m2.g1"}, [][16]byte{first, second}, []string{"password-a", "password-b"})
++
++	if user, password, loaded := service.LookupUser(first); !loaded || user != "m1.g1" || password != "password-a" {
++		t.Fatalf("first credential was not stored: %q %q %v", user, password, loaded)
++	}
++	if !service.authorized(first, "m1.g1") {
++		t.Fatal("an authorized identity was rejected")
++	}
++
++	// Removing the first member keeps the second one intact and makes the old
++	// credential unresolvable.
++	service.UpdateUsers([]string{"m2.g1"}, [][16]byte{second}, []string{"password-b"})
++	if _, _, loaded := service.LookupUser(first); loaded {
++		t.Fatal("a revoked uuid was still resolvable")
++	}
++	if service.authorized(first, "m1.g1") {
++		t.Fatal("a revoked identity was still authorized")
++	}
++	if !service.authorized(second, "m2.g1") {
++		t.Fatal("removing another member revoked the remaining one")
++	}
++}
++
++// A re-added member is a new generation: the uuid resolves again but the old
++// generation must not become authorized.
++func TestAuthorizedRequiresTheSameGeneration(t *testing.T) {
++	service := newTestService(t)
++	id := testUUID(3)
++	service.UpdateUsers([]string{"m1.g1"}, [][16]byte{id}, []string{"password"})
++	service.UpdateUsers([]string{"m1.g2"}, [][16]byte{id}, []string{"password"})
++
++	if user, _, loaded := service.LookupUser(id); !loaded || user != "m1.g2" {
++		t.Fatalf("the re-added generation was not stored: %q %v", user, loaded)
++	}
++	if service.authorized(id, "m1.g1") {
++		t.Fatal("the old generation stayed authorized after a re-add")
++	}
++	if !service.authorized(id, "m1.g2") {
++		t.Fatal("the new generation was not authorized")
++	}
++}
++
++func TestRevokeUnauthorizedToleratesAnEmptyRegistry(t *testing.T) {
++	service := newTestService(t)
++	service.UpdateUsers(nil, nil, nil)
++	service.revokeUnauthorized()
++}
++
++// A credential update must not tear down a session that is still handshaking: it
++// has no identity yet, and LookupUser will judge it against the live table.
++func TestRevocableRequiresAnAuthenticatedCredential(t *testing.T) {
++	service := newTestService(t)
++	service.UpdateUsers([]string{"m1.g1"}, [][16]byte{testUUID(1)}, []string{"password"})
++
++	handshake := &serverSession[string]{Service: service, connDone: make(chan struct{}), authDone: make(chan struct{})}
++	if handshake.revocable() {
++		t.Fatal("an unauthenticated handshake was treated as revoked")
++	}
++
++	authenticated := &serverSession[string]{
++		Service:       service,
++		connDone:      make(chan struct{}),
++		authDone:      make(chan struct{}),
++		authUUID:      testUUID(1),
++		authUser:      "m1.g1",
++		authenticated: true,
++	}
++	if authenticated.revocable() {
++		t.Fatal("an authenticated member in the table was treated as revoked")
++	}
++
++	service.UpdateUsers(nil, nil, nil)
++	if !authenticated.revocable() {
++		t.Fatal("a session whose credential was removed stayed revocable=false")
++	}
++}

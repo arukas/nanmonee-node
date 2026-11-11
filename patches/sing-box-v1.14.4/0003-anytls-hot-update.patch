@@ -1,0 +1,92 @@
+diff --git a/protocol/anytls/inbound.go b/protocol/anytls/inbound.go
+index 54c53d1..f7ac789 100644
+--- a/protocol/anytls/inbound.go
++++ b/protocol/anytls/inbound.go
+@@ -79,6 +79,43 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
+ 	return inbound, nil
+ }
+ 
++// UpdateUsers replaces the accepted credentials without touching the TLS
++// listener, so established sessions keep running while the identity set changes.
++// The authenticated identity of a session is the user name, never an array
++// index, so reordering the users cannot move a session to another member.
++func (h *Inbound) UpdateUsers(users []option.AnyTLSUser) error {
++	converted, err := validateHotUpdateUsers(users)
++	if err != nil {
++		return err
++	}
++	h.service.UpdateUsers(converted)
++	return nil
++}
++
++func validateHotUpdateUsers(users []option.AnyTLSUser) ([]anytls.User, error) {
++	converted := make([]anytls.User, 0, len(users))
++	names := make(map[string]struct{}, len(users))
++	passwords := make(map[string]struct{}, len(users))
++	for _, user := range users {
++		if user.Name == "" {
++			return nil, E.New("anytls hot update requires a stable user name")
++		}
++		if user.Password == "" {
++			return nil, E.New("anytls hot update requires a user password")
++		}
++		if _, loaded := names[user.Name]; loaded {
++			return nil, E.New("anytls hot update requires unique user names")
++		}
++		if _, loaded := passwords[user.Password]; loaded {
++			return nil, E.New("anytls hot update requires unique user passwords")
++		}
++		names[user.Name] = struct{}{}
++		passwords[user.Password] = struct{}{}
++		converted = append(converted, anytls.User{Name: user.Name, Password: user.Password})
++	}
++	return converted, nil
++}
++
+ func (h *Inbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
+ 	if stage != adapter.StartStateStart {
+ 		return nil
+diff --git a/protocol/anytls/nanmonee_hot_update_test.go b/protocol/anytls/nanmonee_hot_update_test.go
+new file mode 100644
+index 0000000..cee285e
+--- /dev/null
++++ b/protocol/anytls/nanmonee_hot_update_test.go
+@@ -0,0 +1,38 @@
++package anytls
++
++import (
++	"testing"
++
++	"github.com/sagernet/sing-box/option"
++)
++
++// The runtime discovers the hot-update capability through this method set.
++type userUpdater interface {
++	UpdateUsers(users []option.AnyTLSUser) error
++}
++
++var _ userUpdater = (*Inbound)(nil)
++
++func TestValidateHotUpdateUsers(t *testing.T) {
++	converted, err := validateHotUpdateUsers([]option.AnyTLSUser{{Name: "m1.g1", Password: "password-1"}})
++	if err != nil || len(converted) != 1 || converted[0].Name != "m1.g1" || converted[0].Password != "password-1" {
++		t.Fatalf("valid update rejected: %+v %v", converted, err)
++	}
++	if converted, err := validateHotUpdateUsers(nil); err != nil || len(converted) != 0 {
++		t.Fatalf("empty update must clear the table: %+v %v", converted, err)
++	}
++
++	cases := map[string][]option.AnyTLSUser{
++		"missing name":       {{Password: "password-1"}},
++		"missing password":   {{Name: "m1.g1"}},
++		"duplicate name":     {{Name: "m1.g1", Password: "password-1"}, {Name: "m1.g1", Password: "password-2"}},
++		"duplicate password": {{Name: "m1.g1", Password: "password-1"}, {Name: "m2.g1", Password: "password-1"}},
++	}
++	for name, users := range cases {
++		t.Run(name, func(t *testing.T) {
++			if _, err := validateHotUpdateUsers(users); err == nil {
++				t.Fatal("invalid update was accepted")
++			}
++		})
++	}
++}

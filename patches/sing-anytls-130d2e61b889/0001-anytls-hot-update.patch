@@ -1,0 +1,401 @@
+diff --git a/service.go b/service.go
+index c58f365..bf8caf7 100644
+--- a/service.go
++++ b/service.go
+@@ -7,6 +7,7 @@ import (
+ 	"errors"
+ 	"net"
+ 	"os"
++	"sync"
+ 
+ 	"github.com/anytls/sing-anytls/padding"
+ 	"github.com/anytls/sing-anytls/session"
+@@ -21,11 +22,16 @@ import (
+ )
+ 
+ type Service struct {
++	userAccess      sync.RWMutex
+ 	users           map[[32]byte]string
+ 	padding         atomic.TypedValue[*padding.PaddingFactory]
+ 	handler         N.TCPConnectionHandlerEx
+ 	fallbackHandler N.TCPConnectionHandlerEx
+ 	logger          logger.ContextLogger
++	sessionAccess   sync.Mutex
++	// sessions maps an established server session to the password hash that
++	// authenticated it, so a later user update can close exactly the revoked ones.
++	sessions map[*session.Session][32]byte
+ }
+ 
+ type ServiceConfig struct {
+@@ -47,6 +53,7 @@ func NewService(config ServiceConfig) (*Service, error) {
+ 		fallbackHandler: config.FallbackHandler,
+ 		logger:          config.Logger,
+ 		users:           make(map[[32]byte]string),
++		sessions:        make(map[*session.Session][32]byte),
+ 	}
+ 
+ 	if service.handler == nil || service.logger == nil {
+@@ -64,12 +71,66 @@ func NewService(config ServiceConfig) (*Service, error) {
+ 	return service, nil
+ }
+ 
++// UpdateUsers replaces the accepted credential table and closes the sessions
++// that no longer hold a valid credential.
+ func (s *Service) UpdateUsers(users []User) {
+-	u := make(map[[32]byte]string)
++	u := make(map[[32]byte]string, len(users))
+ 	for _, user := range users {
+ 		u[sha256.Sum256([]byte(user.Password))] = user.Name
+ 	}
++	s.userAccess.Lock()
+ 	s.users = u
++	s.userAccess.Unlock()
++	s.revokeUnauthorized()
++}
++
++// LookupUser resolves an authenticated password hash to its member identity.
++func (s *Service) LookupUser(passwordSha256 [32]byte) (string, bool) {
++	s.userAccess.RLock()
++	defer s.userAccess.RUnlock()
++	user, loaded := s.users[passwordSha256]
++	return user, loaded
++}
++
++func (s *Service) authorized(passwordSha256 [32]byte) bool {
++	_, loaded := s.LookupUser(passwordSha256)
++	return loaded
++}
++
++// registerSession publishes a session before it starts receiving streams. A
++// credential that was revoked between the handshake and this point is refused
++// immediately instead of being admitted by a stale table read.
++func (s *Service) registerSession(serverSession *session.Session, passwordSha256 [32]byte) bool {
++	s.sessionAccess.Lock()
++	s.sessions[serverSession] = passwordSha256
++	s.sessionAccess.Unlock()
++	if !s.authorized(passwordSha256) {
++		_ = serverSession.Close()
++		return false
++	}
++	return true
++}
++
++func (s *Service) unregisterSession(serverSession *session.Session) {
++	s.sessionAccess.Lock()
++	delete(s.sessions, serverSession)
++	s.sessionAccess.Unlock()
++}
++
++// revokeUnauthorized closes every established session whose credential is no
++// longer in the table, so revocation also ends already multiplexed streams.
++func (s *Service) revokeUnauthorized() {
++	s.sessionAccess.Lock()
++	stale := make([]*session.Session, 0, len(s.sessions))
++	for serverSession, passwordSha256 := range s.sessions {
++		if !s.authorized(passwordSha256) {
++			stale = append(stale, serverSession)
++		}
++	}
++	s.sessionAccess.Unlock()
++	for _, serverSession := range stale {
++		_ = serverSession.Close()
++	}
+ }
+ 
+ // NewConnection `conn` should be plaintext
+@@ -90,8 +151,9 @@ func (s *Service) NewConnection(ctx context.Context, conn net.Conn, source M.Soc
+ 	}
+ 	var passwordSha256 [32]byte
+ 	copy(passwordSha256[:], by)
+-	if user, ok := s.users[passwordSha256]; ok {
+-		ctx = auth.ContextWithUser(ctx, user)
++	userName, loaded := s.LookupUser(passwordSha256)
++	if loaded {
++		ctx = auth.ContextWithUser(ctx, userName)
+ 	} else {
+ 		b.Resize(0, n)
+ 		return s.fallback(ctx, conn, source, E.New("unknown user password"), onClose)
+@@ -110,7 +172,7 @@ func (s *Service) NewConnection(ctx context.Context, conn net.Conn, source M.Soc
+ 		}
+ 	}
+ 
+-	session := session.NewServerSession(conn, func(stream *session.Stream) {
++	serverSession := session.NewServerSession(conn, func(stream *session.Stream) {
+ 		destination, err := M.SocksaddrSerializer.ReadAddrPort(stream)
+ 		if err != nil {
+ 			s.logger.ErrorContext(ctx, "ReadAddrPort:", err)
+@@ -119,8 +181,15 @@ func (s *Service) NewConnection(ctx context.Context, conn net.Conn, source M.Soc
+ 
+ 		s.handler.NewConnectionEx(ctx, stream, source, destination, onClose)
+ 	}, &s.padding, s.logger)
+-	session.Run()
+-	session.Close()
++	// Re-check the credential for every new stream: closing a session and a
++	// concurrent stream creation may otherwise interleave.
++	serverSession.SetAuthorization(func() bool { return s.authorized(passwordSha256) })
++	serverSession.SetCloseHook(func() { s.unregisterSession(serverSession) })
++	if !s.registerSession(serverSession, passwordSha256) {
++		return nil
++	}
++	serverSession.Run()
++	_ = serverSession.Close()
+ 	return nil
+ }
+ 
+diff --git a/service_test.go b/service_test.go
+new file mode 100644
+index 0000000..89828eb
+--- /dev/null
++++ b/service_test.go
+@@ -0,0 +1,133 @@
++package anytls
++
++import (
++	"context"
++	"crypto/sha256"
++	"net"
++	"sync"
++	"testing"
++
++	"github.com/anytls/sing-anytls/padding"
++	"github.com/anytls/sing-anytls/session"
++	"github.com/sagernet/sing/common/logger"
++	M "github.com/sagernet/sing/common/metadata"
++	N "github.com/sagernet/sing/common/network"
++)
++
++type discardHandler struct{}
++
++func (discardHandler) NewConnectionEx(context.Context, net.Conn, M.Socksaddr, M.Socksaddr, N.CloseHandlerFunc) {
++}
++
++func hashOf(password string) [32]byte {
++	return sha256.Sum256([]byte(password))
++}
++
++func newTestService(t *testing.T, users []User) *Service {
++	t.Helper()
++	service, err := NewService(ServiceConfig{
++		Users:         users,
++		PaddingScheme: padding.DefaultPaddingScheme,
++		Handler:       discardHandler{},
++		Logger:        logger.NOP(),
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	return service
++}
++
++// newTestSession builds a server session over an in-memory pipe. These tests
++// never run the session loop: they only exercise registration and revocation.
++func newTestSession(t *testing.T, service *Service) *session.Session {
++	t.Helper()
++	pipeClient, pipeServer := net.Pipe()
++	t.Cleanup(func() { _ = pipeClient.Close() })
++	return session.NewServerSession(pipeServer, func(*session.Stream) {}, &service.padding, logger.NOP())
++}
++
++func (s *Service) registeredSessions() int {
++	s.sessionAccess.Lock()
++	defer s.sessionAccess.Unlock()
++	return len(s.sessions)
++}
++
++func TestUpdateUsersClosesRevokedSession(t *testing.T) {
++	service := newTestService(t, []User{{Name: "m1.g1", Password: "password-1"}})
++	serverSession := newTestSession(t, service)
++	serverSession.SetCloseHook(func() { service.unregisterSession(serverSession) })
++	if !service.registerSession(serverSession, hashOf("password-1")) {
++		t.Fatal("an authorized credential was refused")
++	}
++	if service.registeredSessions() != 1 {
++		t.Fatal("session was not registered")
++	}
++
++	service.UpdateUsers([]User{{Name: "m1.g1", Password: "password-2"}})
++	if !serverSession.IsClosed() {
++		t.Fatal("revoked session must be closed by the update")
++	}
++	if service.registeredSessions() != 0 {
++		t.Fatal("closed session must unregister itself")
++	}
++	if _, loaded := service.LookupUser(hashOf("password-1")); loaded {
++		t.Fatal("revoked credential must not be accepted")
++	}
++	if user, loaded := service.LookupUser(hashOf("password-2")); !loaded || user != "m1.g1" {
++		t.Fatalf("rotated credential missing: %q %v", user, loaded)
++	}
++}
++
++func TestUpdateUsersKeepsAuthorizedSession(t *testing.T) {
++	service := newTestService(t, []User{{Name: "m1.g1", Password: "password-1"}})
++	serverSession := newTestSession(t, service)
++	serverSession.SetCloseHook(func() { service.unregisterSession(serverSession) })
++	if !service.registerSession(serverSession, hashOf("password-1")) {
++		t.Fatal("an authorized credential was refused")
++	}
++	service.UpdateUsers([]User{{Name: "m1.g2", Password: "password-1"}})
++	if serverSession.IsClosed() {
++		t.Fatal("a session whose credential survived the update must keep running")
++	}
++	if user, loaded := service.LookupUser(hashOf("password-1")); !loaded || user != "m1.g2" {
++		t.Fatalf("identity was not replaced: %q %v", user, loaded)
++	}
++}
++
++func TestRegisterSessionRefusesRevokedCredential(t *testing.T) {
++	service := newTestService(t, nil)
++	serverSession := newTestSession(t, service)
++	serverSession.SetCloseHook(func() { service.unregisterSession(serverSession) })
++	if service.registerSession(serverSession, hashOf("password-1")) {
++		t.Fatal("an unknown credential was registered")
++	}
++	if !serverSession.IsClosed() {
++		t.Fatal("a session registered with an unknown credential must be closed")
++	}
++	if service.registeredSessions() != 0 {
++		t.Fatal("a refused session must not stay registered")
++	}
++}
++
++func TestUpdateUsersAndLookupAreRaceFree(t *testing.T) {
++	service := newTestService(t, []User{{Name: "m1.g1", Password: "password-1"}})
++	serverSession := newTestSession(t, service)
++	serverSession.SetCloseHook(func() { service.unregisterSession(serverSession) })
++	service.registerSession(serverSession, hashOf("password-1"))
++
++	var wait sync.WaitGroup
++	for index := 0; index < 8; index++ {
++		wait.Add(1)
++		go func(index int) {
++			defer wait.Done()
++			password := "password-1"
++			if index%2 == 0 {
++				password = "password-2"
++			}
++			service.UpdateUsers([]User{{Name: "m1.g1", Password: password}})
++			service.LookupUser(hashOf(password))
++			service.UpdateUsers([]User{{Name: "m1.g1", Password: "password-1"}})
++		}(index)
++	}
++	wait.Wait()
++}
+diff --git a/session/session.go b/session/session.go
+index 893cc72..542ad73 100644
+--- a/session/session.go
++++ b/session/session.go
+@@ -50,6 +50,7 @@ type Session struct {
+ 
+ 	// server
+ 	onNewStream func(stream *Stream)
++	authorized  func() bool
+ }
+ 
+ func NewClientSession(conn net.Conn, _padding *atomic.TypedValue[*padding.PaddingFactory], logger logger.Logger) *Session {
+@@ -96,6 +97,17 @@ func (s *Session) Run() {
+ 	go s.recvLoop()
+ }
+ 
++// SetAuthorization installs the check used before a server-side stream is
++// accepted. A rejected check closes the whole session.
++func (s *Session) SetAuthorization(check func() bool) {
++	s.authorized = check
++}
++
++// SetCloseHook installs a callback invoked exactly once when the session closes.
++func (s *Session) SetCloseHook(hook func()) {
++	s.dieHook = hook
++}
++
+ // IsClosed does a safe check to see if we have shutdown
+ func (s *Session) IsClosed() bool {
+ 	select {
+@@ -209,6 +221,12 @@ func (s *Session) recvLoop() error {
+ 					s.writeControlFrame(f)
+ 					return nil
+ 				}
++				if !s.isClient && s.authorized != nil && !s.authorized() {
++					f := newFrame(cmdAlert, 0)
++					f.data = []byte("user is no longer authorized")
++					s.writeControlFrame(f)
++					return nil
++				}
+ 				s.streamLock.Lock()
+ 				if _, ok := s.streams[sid]; !ok {
+ 					stream := newStream(sid, s)
+diff --git a/session/stream.go b/session/stream.go
+index a962374..a0fcd8f 100644
+--- a/session/stream.go
++++ b/session/stream.go
+@@ -8,6 +8,7 @@ import (
+ 	"time"
+ 
+ 	"github.com/anytls/sing-anytls/pipe"
++	"github.com/sagernet/sing/common/atomic"
+ )
+ 
+ // Stream implements net.Conn
+@@ -22,7 +23,10 @@ type Stream struct {
+ 
+ 	dieOnce sync.Once
+ 	dieHook func()
+-	dieErr  error
++	// dieErr is written by whichever goroutine closes the stream first and read
++	// by the routed side, so it must be accessed atomically. A revocation closes
++	// a stream while the copy loop may still be writing to it.
++	dieErr atomic.TypedValue[error]
+ 
+ 	reportOnce sync.Once
+ }
+@@ -40,8 +44,10 @@ func newStream(id uint32, sess *Session) *Stream {
+ // Read implements net.Conn
+ func (s *Stream) Read(b []byte) (n int, err error) {
+ 	n, err = s.pipeR.Read(b)
+-	if n == 0 && s.dieErr != nil {
+-		err = s.dieErr
++	if n == 0 {
++		if dieErr := s.dieErr.Load(); dieErr != nil {
++			err = dieErr
++		}
+ 	}
+ 	return
+ }
+@@ -53,8 +59,8 @@ func (s *Stream) Write(b []byte) (n int, err error) {
+ 		return 0, os.ErrDeadlineExceeded
+ 	default:
+ 	}
+-	if s.dieErr != nil {
+-		return 0, s.dieErr
++	if dieErr := s.dieErr.Load(); dieErr != nil {
++		return 0, dieErr
+ 	}
+ 	n, err = s.sess.writeDataFrame(s.id, b)
+ 	return
+@@ -69,7 +75,7 @@ func (s *Stream) Close() error {
+ func (s *Stream) closeLocally() {
+ 	var once bool
+ 	s.dieOnce.Do(func() {
+-		s.dieErr = net.ErrClosed
++		s.dieErr.Store(net.ErrClosed)
+ 		s.pipeR.Close()
+ 		once = true
+ 	})
+@@ -84,7 +90,7 @@ func (s *Stream) closeLocally() {
+ func (s *Stream) closeWithError(err error) error {
+ 	var once bool
+ 	s.dieOnce.Do(func() {
+-		s.dieErr = err
++		s.dieErr.Store(err)
+ 		s.pipeR.Close()
+ 		once = true
+ 	})
+@@ -95,7 +101,7 @@ func (s *Stream) closeWithError(err error) error {
+ 		}
+ 		return s.sess.streamClosed(s.id)
+ 	} else {
+-		return s.dieErr
++		return s.dieErr.Load()
+ 	}
+ }
+ 

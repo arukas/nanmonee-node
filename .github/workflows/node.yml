@@ -1,0 +1,143 @@
+name: node
+
+# One workflow, two jobs. Pull requests and pushes to the main branch build and
+# test the tree; an explicit node-v* tag runs the same checks again and only then
+# publishes the artifacts that this very run built and verified. No job checks
+# out the panel repository, and none reaches a production host.
+
+on:
+  push:
+    branches: [master]
+    tags: ['node-v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: build and test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The node scripts prefix every command with rtk, so the pinned release is
+      # installed from the checksum recorded here rather than from a moving tag.
+      - name: Install the pinned RTK
+        env:
+          RTK_SHA256: 70fee7b4a548c43dde94c77e2335550981b0bc2fb013691d8c8109b5bd0eda37
+        run: |
+          curl -fsSL -o /tmp/rtk.tar.gz \
+            https://github.com/rtk-ai/rtk/releases/download/v1.2.0/rtk-x86_64-unknown-linux-musl.tar.gz
+          echo "${RTK_SHA256}  /tmp/rtk.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/rtk.tar.gz -C /tmp rtk
+          sudo install -m 0755 /tmp/rtk /usr/local/bin/rtk
+          rtk --version
+
+      # The build runs inside the fixed image. The runner toolchain is only used
+      # for vet, gofmt and the test run, and must match the image's Go release.
+      - name: Install Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.26.8'
+          cache: false
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.x'
+
+      - name: Build the pinned artifacts
+        working-directory: node
+        run: rtk ./scripts/build.sh
+
+      - name: Regenerate the protocol files
+        working-directory: node
+        run: |
+          rtk ./scripts/generate-proto.sh
+          rtk git diff --exit-code -- api/node/v1
+
+      - name: Check formatting
+        working-directory: node
+        run: |
+          test -z "$(rtk gofmt -l api cmd internal)"
+
+      - name: Vet and test
+        working-directory: node
+        run: |
+          rtk go vet -mod=readonly -tags 'with_quic with_utls' ./...
+          rtk go test -mod=readonly -race -count=1 -p=2 -tags 'with_quic with_utls' ./...
+
+      - name: Test the patched kernels
+        working-directory: node
+        run: rtk ./scripts/test_kernels.sh
+
+      - name: Test the preparation and manifest scripts
+        run: rtk python3 -m unittest discover -s node/scripts -p 'test_*.py'
+
+      - name: Package the artifacts
+        env:
+          PANEL_COMMIT: 823ca5b4958458ce6dac056b08347bce58bb3e25
+        run: |
+          set -eu
+          mkdir -p dist
+          install -m 0755 node/.build/nanmonee-node dist/nanmonee-node
+          install -m 0755 node/.build/nanmonee-nodectl dist/nanmonee-nodectl
+          cp node/deploy/README.md dist/DEPLOY.md
+          cp LICENSE dist/LICENSE
+          rtk python3 node/scripts/write_manifest.py --write dist/build-manifest.json \
+            --node-commit "${GITHUB_SHA}" \
+            --panel-commit "${PANEL_COMMIT}"
+          rtk python3 node/scripts/write_manifest.py --check dist/build-manifest.json
+          (cd dist && rtk shasum -a 256 nanmonee-node nanmonee-nodectl build-manifest.json DEPLOY.md LICENSE | tee SHA256SUMS)
+
+      - name: Upload the verified artifacts
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: nanmonee-node-linux-amd64
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: publish the prerelease
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/node-v')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      # This job only moves the already verified artifact set. It rebuilds
+      # nothing, so the published files are byte-identical to the ones the test
+      # job checked.
+      - name: Download the verified artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: nanmonee-node-linux-amd64
+          path: dist/
+
+      - name: Verify the downloaded digests
+        run: |
+          set -eu
+          cd dist
+          sha256sum -c SHA256SUMS
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -eu
+          gh release create "${TAG}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --verify-tag \
+            --prerelease \
+            --title "nanmonee-node ${TAG}" \
+            --notes "Artifacts built and verified by ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID} from ${GITHUB_SHA}." \
+            dist/nanmonee-node dist/nanmonee-nodectl dist/build-manifest.json dist/DEPLOY.md dist/LICENSE dist/SHA256SUMS

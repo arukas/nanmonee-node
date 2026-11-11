@@ -1,0 +1,6 @@
+# Derived build inputs and outputs.
+.cache/
+.build/
+dist/
+__pycache__/
+*.pyc
