@@ -65,7 +65,14 @@ jobs:
       - name: Check formatting
         working-directory: node
         run: |
-          test -z "$(rtk gofmt -l api cmd internal)"
+          # Capture explicitly: a failing toolchain must not look like "no output".
+          unformatted="$(rtk gofmt -l api cmd internal)"
+          if [ -n "${unformatted}" ]; then
+            echo "these files need gofmt:"
+            echo "${unformatted}"
+            exit 1
+          fi
+          echo "gofmt clean"
 
       - name: Vet and test
         working-directory: node
