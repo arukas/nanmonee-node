@@ -29,6 +29,7 @@ import argparse
 import hashlib
 import json
 import pathlib
+import subprocess
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -56,6 +57,7 @@ INPUT_FILES = {
     "manifest_script_sha256": "node/scripts/write_manifest.py",
 }
 DEPENDENCIES = ("core", "quic", "anytls")
+PANEL_ROLE = "migration-origin"
 ARTIFACTS = (
     ("node/.build/nanmonee-node", "nanmonee-node"),
     ("node/.build/nanmonee-nodectl", "nanmonee-nodectl"),
@@ -179,7 +181,12 @@ def manifest(node_commit: str, panel_commit: str, tag: str | None, prerelease: b
         "agent": {"name": "nanmonee-node", "version": AGENT_VERSION, "api_protocol": "nanmonee-node-v1"},
         "sources": {
             "node": {"repository": "https://github.com/arukas/nanmonee-node", "commit": node_commit},
-            "panel": {"repository": "https://github.com/arukas/nanmonee", "commit": panel_commit},
+            "panel": {
+                "repository": "https://github.com/arukas/nanmonee",
+                "commit": panel_commit,
+                "role": PANEL_ROLE,
+                "note": "The panel is a separate repository: this commit is only the migration origin of the exported tree, not a build input.",
+            },
         },
         "toolchain": TOOLCHAIN,
         "build": BUILD,
@@ -192,6 +199,57 @@ def manifest(node_commit: str, panel_commit: str, tag: str | None, prerelease: b
         record["tag"] = tag
         record["prerelease"] = prerelease
     return record
+
+
+def check_sources(manifest: dict) -> int:
+    """Validate the recorded commits and the role each of them plays.
+
+    The node commit must be the revision this checkout is, so a manifest cannot
+    name a stale or unrelated build source. The panel commit is only the
+    migration origin: the panel is a separate repository and never part of this
+    build, so it is recorded under an explicit role and checked for shape.
+    """
+    problems = 0
+    sources = manifest.get("sources", {})
+    node = sources.get("node")
+    if node is None:
+        print("sources: node commit is not recorded")
+        problems += 1
+    else:
+        commit = node.get("commit", "")
+        if not is_commit(commit):
+            print("sources: node commit must be a full 40-character lowercase SHA")
+            problems += 1
+        elif commit != git_head():
+            print(f"sources: node commit {commit} is not this checkout ({git_head()})")
+            problems += 1
+    panel = sources.get("panel")
+    if panel is None:
+        print("sources: panel commit is not recorded")
+        problems += 1
+    else:
+        if not is_commit(panel.get("commit", "")):
+            print("sources: panel commit must be a full 40-character lowercase SHA")
+            problems += 1
+        if panel.get("role") != PANEL_ROLE:
+            print(f"sources: panel must be recorded as {PANEL_ROLE!r}, not {panel.get('role')!r}")
+            problems += 1
+    return problems
+
+
+def git_head() -> str | None:
+    """Return the commit this checkout is, or None outside a Git checkout."""
+    if not (ROOT / ".git").exists():
+        return None
+    result = subprocess.run(
+        ["git", "-C", str(ROOT), "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip()
 
 
 def check(manifest_path: pathlib.Path) -> int:
@@ -215,16 +273,9 @@ def check(manifest_path: pathlib.Path) -> int:
         dependency = manifest[section]
         references.extend((patch["path"], patch["sha256"]) for patch in dependency["patches"])
         references.append((dependency["patched_files"], dependency["patched_files_sha256"]))
+        references.append((dependency["license_file"], dependency["license_sha256"]))
     references.extend((artifact["path"], artifact["sha256"]) for artifact in manifest["artifacts"])
-    sources = manifest.get("sources", {})
-    for kind in ("node", "panel"):
-        reference = sources.get(kind)
-        if reference is None:
-            print(f"sources: {kind} commit is not recorded")
-            problems += 1
-        elif len(reference.get("commit", "")) != 40:
-            print(f"sources: {kind} commit must be a full 40-character SHA")
-            problems += 1
+    problems += check_sources(manifest)
     for relative, expected in references:
         path = ROOT / relative
         if not path.is_file() or digest(path) != expected:

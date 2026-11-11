@@ -36,6 +36,7 @@ DEPENDENCIES = {
         "license": "GPL-3.0-or-later",
         "patches": ["patches/sing-box-v1.14.4/0001-vless-hot-update.patch"],
         "patched_files": "patches/sing-box-v1.14.4/patched-files.sha256",
+        "license_file": "patches/sing-box-v1.14.4/LICENSE",
     },
     "quic": {
         "source": "https://github.com/sagernet/sing-quic",
@@ -43,6 +44,7 @@ DEPENDENCIES = {
         "license": "GPL-3.0-or-later",
         "patches": ["patches/sing-quic-7e0a5869a5f4/0001-hysteria2-hot-update.patch"],
         "patched_files": "patches/sing-quic-7e0a5869a5f4/patched-files.sha256",
+        "license_file": "patches/sing-quic-7e0a5869a5f4/LICENSE",
     },
     "anytls": {
         "source": "https://github.com/anytls/sing-anytls",
@@ -51,6 +53,7 @@ DEPENDENCIES = {
         "license": "MIT",
         "patches": ["patches/sing-anytls-130d2e61b889/0001-anytls-hot-update.patch"],
         "patched_files": "patches/sing-anytls-130d2e61b889/patched-files.sha256",
+        "license_file": "patches/sing-anytls-130d2e61b889/LICENSE",
     },
 }
 BUILT_ARTIFACTS = ("node/.build/nanmonee-node", "node/.build/nanmonee-nodectl")
@@ -64,7 +67,12 @@ def artifacts() -> tuple[str, ...]:
 
 
 def synthesise() -> dict:
-    record = {"sources": {"node": {"commit": "0" * 40}, "panel": {"commit": "1" * 40}}}
+    record = {
+        "sources": {
+            "node": {"commit": manifest.git_head() or "0" * 40},
+            "panel": {"commit": "1" * 40, "role": manifest.PANEL_ROLE},
+        }
+    }
     record.update(manifest.fingerprint())
     for name, dependency in DEPENDENCIES.items():
         record[name] = copy.deepcopy(dependency)
@@ -74,6 +82,9 @@ def synthesise() -> dict:
         ]
         record[name]["patched_files_sha256"] = hashlib.sha256(
             (ROOT / dependency["patched_files"]).read_bytes()
+        ).hexdigest()
+        record[name]["license_sha256"] = hashlib.sha256(
+            (ROOT / dependency["license_file"]).read_bytes()
         ).hexdigest()
     record["artifacts"] = [
         {"path": path, "sha256": hashlib.sha256((ROOT / path).read_bytes()).hexdigest()}
@@ -118,6 +129,33 @@ class ManifestTests(unittest.TestCase):
     def test_a_short_panel_commit_is_rejected(self):
         changed = copy.deepcopy(self.record)
         changed["sources"]["panel"]["commit"] = "61d82c7"
+        self.assertEqual(self.check(changed), 1)
+
+    def test_the_panel_commit_must_stay_a_migration_origin(self):
+        for role in (None, "build-input"):
+            with self.subTest(role=role):
+                changed = copy.deepcopy(self.record)
+                if role is None:
+                    changed["sources"]["panel"].pop("role", None)
+                else:
+                    changed["sources"]["panel"]["role"] = role
+                self.assertEqual(self.check(changed), 1)
+
+    def test_a_node_commit_that_is_not_this_checkout_is_rejected(self):
+        changed = copy.deepcopy(self.record)
+        changed["sources"]["node"]["commit"] = "d" * 40
+        self.assertEqual(self.check(changed), 1)
+
+    def test_a_wrong_licence_digest_is_rejected(self):
+        for section in DEPENDENCIES:
+            with self.subTest(section=section):
+                changed = copy.deepcopy(self.record)
+                changed[section]["license_sha256"] = "0" * 64
+                self.assertEqual(self.check(changed), 1)
+
+    def test_a_missing_artifact_is_rejected(self):
+        changed = copy.deepcopy(self.record)
+        changed["artifacts"][0]["path"] = "node/.build/not-built"
         self.assertEqual(self.check(changed), 1)
 
     def test_changed_recorded_inputs_patches_and_artifacts_are_rejected(self):
