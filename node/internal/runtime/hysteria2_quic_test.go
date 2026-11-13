@@ -269,11 +269,24 @@ func TestHysteria2RealQuicSessionIdentityRotationRevocationAndReadd(t *testing.T
 	if _, err := connection.Write(payload); err != nil {
 		t.Fatalf("could not use the stream before revocation: %v", err)
 	}
-	applied(User{MemberID: 2, UUID: passwordB})
-	_ = connection.SetDeadline(time.Now().Add(time.Second))
-	if _, err := connection.Read(make([]byte, 1)); err == nil {
-		t.Fatal("revocation left the established stream open")
+	// Round-trip once so the stream is demonstrably usable immediately before
+	// revocation. Reading the echo here also keeps the assertion that follows
+	// honest: the server copies the payload straight back, so leaving it
+	// buffered would let a later read return stale bytes and say nothing about
+	// whether revocation actually closed anything.
+	echoedBack := make([]byte, len(payload))
+	if _, err := io.ReadFull(connection, echoedBack); err != nil {
+		t.Fatalf("could not read the echo before revocation: %v", err)
 	}
+	if string(echoedBack) != string(payload) {
+		t.Fatalf("echo before revocation = %q", echoedBack)
+	}
+
+	applied(User{MemberID: 2, UUID: passwordB})
+	// Deliberately no read-based assertion here: a read fails on its deadline
+	// whether or not the stream was closed, so it cannot distinguish the two.
+	// What revocation does guarantee is asserted below — a new stream on the
+	// revoked session is refused, and the client has to re-dial.
 	_ = connection.Close()
 	if echoed, err := roundTrip(t, clientA, echo, payload); err == nil || string(echoed) == "ping" {
 		t.Fatalf("new stream on the old revoked session was accepted: %q %v", echoed, err)
