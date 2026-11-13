@@ -487,6 +487,47 @@ func (c *Client) Users(ctx context.Context, etag string) (UserSnapshot, error) {
 	return UserSnapshot{Members: members, ETag: response.etag}, nil
 }
 
+// ProbeTargets pulls the addresses this node should measure.
+//
+// The list is global rather than per node, and the panel returns it without an
+// ETag, so every pull is a full document.
+func (c *Client) ProbeTargets(ctx context.Context) ([]ProbeTarget, error) {
+	response, err := c.do(ctx, http.MethodGet, "/api/node/v1/probes", nil, nil, "")
+	if err != nil {
+		return nil, err
+	}
+	var document probeTargetResponse
+	if err := decodeStrict(response, &document); err != nil {
+		return nil, err
+	}
+	if document.Targets == nil {
+		return nil, fmt.Errorf("%w: the panel returned no targets array", ErrTransient)
+	}
+	return document.Targets, nil
+}
+
+// ReportProbeSamples submits measurements and requires the panel to accept them.
+func (c *Client) ReportProbeSamples(ctx context.Context, samples ProbeSamples) error {
+	payload, err := json.Marshal(samples)
+	if err != nil {
+		return err
+	}
+	response, err := c.do(ctx, http.MethodPost, "/api/node/v1/probes", nil, payload, "")
+	if err != nil {
+		return err
+	}
+	var ack struct {
+		Accepted int `json:"accepted"`
+	}
+	if err := decodeStrict(response, &ack); err != nil {
+		return err
+	}
+	if ack.Accepted < 0 || ack.Accepted > len(samples.Results) {
+		return fmt.Errorf("%w: the panel acknowledged %d of %d probe samples", ErrTransient, ack.Accepted, len(samples.Results))
+	}
+	return nil
+}
+
 // ReportTrafficBatch submits one immutable batch and requires an exact echo.
 func (c *Client) ReportTrafficBatch(ctx context.Context, batch TrafficBatch) error {
 	// The panel authenticates the report from the JSON body only, and rejects

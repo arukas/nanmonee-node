@@ -229,3 +229,32 @@ type userResponse struct {
 		UUID string `json:"uuid"`
 	} `json:"users"`
 }
+
+// ProbeTarget is one address the panel asks this node to measure.
+type ProbeTarget struct {
+	ID              int64  `json:"id"`
+	Name            string `json:"name"`
+	Type            string `json:"type"`
+	Host            string `json:"host"`
+	Port            int    `json:"port"`
+	IntervalSeconds int    `json:"interval_seconds"`
+	TimeoutMS       int    `json:"timeout_ms"`
+}
+
+// ProbeSamples is one report body: the measurements this node just took.
+type ProbeSamples struct {
+	Results []ProbeSample `json:"results"`
+}
+
+// ProbeSample is a single measurement. Exactly one of Latency or Error is set.
+type ProbeSample struct {
+	TargetID  int64  `json:"target_id"`
+	LatencyMS *int64 `json:"latency_ms"`
+	Error     string `json:"error"`
+	SampledAt int64  `json:"sampled_at"`
+}
+
+// probeTargetResponse mirrors the panel's /api/node/v1/probes document.
+type probeTargetResponse struct {
+	Targets []ProbeTarget `json:"targets"`
+}

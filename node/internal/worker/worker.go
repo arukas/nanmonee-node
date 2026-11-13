@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"nanmonee/node/internal/panel"
+	"nanmonee/node/internal/probe"
 	noderuntime "nanmonee/node/internal/runtime"
 	"nanmonee/node/internal/traffic"
 )
@@ -24,6 +25,12 @@ const (
 	requestTimeout = 20 * time.Second
 	// shutdownReportTimeout bounds the final drain during shutdown.
 	shutdownReportTimeout = 10 * time.Second
+	// probeTickInterval is how often the worker checks for due probe targets.
+	// Per-target intervals still decide whether a probe actually runs.
+	probeTickInterval = 5 * time.Second
+	// probeConcurrency bounds simultaneous measurements so a long target list
+	// cannot open an unbounded number of sockets.
+	probeConcurrency = 4
 )
 
 // Observer exposes the worker's own view for the control plane status message.
@@ -63,6 +70,12 @@ type Worker struct {
 	usersETag  string
 	hasConfig  bool
 	hasUsers   bool
+
+	// Probe targets are re-read from the panel each pull; the map records when
+	// each target was last measured so the node honours its own interval.
+	probeMu      sync.Mutex
+	probeTargets []panel.ProbeTarget
+	probeLastRun map[int64]time.Time
 
 	// Cache the last fetched config and users; apply only after both pulls succeed.
 	pendingConfig noderuntime.Config
@@ -135,6 +148,10 @@ func (w *Worker) Run(ctx context.Context) error {
 	defer push.Stop()
 	sample := time.NewTicker(w.sampleInterval)
 	defer sample.Stop()
+	// One tick drives every probe target; per-target intervals are enforced
+	// against the last run rather than by a ticker each.
+	probe := time.NewTicker(probeTickInterval)
+	defer probe.Stop()
 
 	for {
 		select {
@@ -143,8 +160,12 @@ func (w *Worker) Run(ctx context.Context) error {
 		case <-pull.C:
 			// Errors are recorded, never fatal: the last good snapshot stays live.
 			_ = w.sync(ctx, false)
+			_ = w.refreshProbeTargets(ctx)
 		case <-sample.C:
 			_ = w.collect(ctx, false)
+		case <-probe.C:
+			// A probe failure must never disturb traffic reporting.
+			_ = w.runProbes(ctx)
 		case <-push.C:
 			_ = w.collect(ctx, true)
 		}
@@ -408,4 +429,124 @@ func (w *Worker) shutdown() error {
 	ctx, cancel := context.WithTimeout(context.Background(), shutdownReportTimeout)
 	defer cancel()
 	return errors.Join(closeErr, w.collect(ctx, true))
+}
+
+// refreshProbeTargets reloads the address list the panel wants measured.
+func (w *Worker) refreshProbeTargets(ctx context.Context) error {
+	requestCtx, cancel := context.WithTimeout(ctx, requestTimeout)
+	defer cancel()
+
+	targets, err := w.client.ProbeTargets(requestCtx)
+	if err != nil {
+		w.setError(err)
+		return err
+	}
+
+	w.probeMu.Lock()
+	w.probeTargets = targets
+	if w.probeLastRun == nil {
+		w.probeLastRun = make(map[int64]time.Time)
+	}
+	// Drop timing state for targets the panel removed, so a re-added target with
+	// the same ID starts fresh.
+	live := make(map[int64]time.Time, len(targets))
+	for _, target := range targets {
+		if last, ok := w.probeLastRun[target.ID]; ok {
+			live[target.ID] = last
+		}
+	}
+	w.probeLastRun = live
+	w.probeMu.Unlock()
+
+	return nil
+}
+
+// runProbes measures every target whose interval has elapsed and reports the
+// batch. Measurement failures are data, not worker errors: they are sent to the
+// panel as a sample with an error and never stop the loop.
+func (w *Worker) runProbes(ctx context.Context) error {
+	w.probeMu.Lock()
+	due := make([]panel.ProbeTarget, 0, len(w.probeTargets))
+	now := time.Now()
+	for _, target := range w.probeTargets {
+		interval := time.Duration(target.IntervalSeconds) * time.Second
+		if interval <= 0 {
+			interval = time.Minute
+		}
+		if last, ok := w.probeLastRun[target.ID]; ok && now.Sub(last) < interval {
+			continue
+		}
+		// Mark before measuring so a slow probe cannot be started twice.
+		w.probeLastRun[target.ID] = now
+		due = append(due, target)
+	}
+	w.probeMu.Unlock()
+
+	if len(due) == 0 {
+		return nil
+	}
+
+	results := make([]panel.ProbeSample, len(due))
+	semaphore := make(chan struct{}, probeConcurrency)
+	var group sync.WaitGroup
+	for index, target := range due {
+		group.Add(1)
+		go func(index int, target panel.ProbeTarget) {
+			defer group.Done()
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }()
+
+			probeType, ok := probeTypeOf(target.Type)
+			if !ok {
+				results[index] = panel.ProbeSample{
+					TargetID:  target.ID,
+					Error:     "unsupported probe type",
+					SampledAt: time.Now().Unix(),
+				}
+				return
+			}
+
+			measured := probe.Measure(ctx, probe.Target{
+				ID:      target.ID,
+				Type:    probeType,
+				Host:    target.Host,
+				Port:    target.Port,
+				Timeout: time.Duration(target.TimeoutMS) * time.Millisecond,
+			})
+
+			sample := panel.ProbeSample{
+				TargetID:  measured.TargetID,
+				LatencyMS: measured.LatencyMS,
+				Error:     measured.Err,
+				SampledAt: measured.SampledAt.Unix(),
+			}
+			results[index] = sample
+		}(index, target)
+	}
+	group.Wait()
+
+	requestCtx, cancel := context.WithTimeout(ctx, requestTimeout)
+	defer cancel()
+	if err := w.client.ReportProbeSamples(requestCtx, panel.ProbeSamples{Results: results}); err != nil {
+		w.setError(err)
+		return err
+	}
+
+	return nil
+}
+
+// probeTypeOf maps the panel's wire value onto the probe package's type.
+func probeTypeOf(value string) (probe.Type, bool) {
+	switch probe.Type(value) {
+	case probe.TypeICMP:
+		return probe.TypeICMP, true
+	case probe.TypeTCP:
+		return probe.TypeTCP, true
+	case probe.TypeHTTP:
+		return probe.TypeHTTP, true
+	case probe.TypeHTTPS:
+		return probe.TypeHTTPS, true
+	default:
+		return "", false
+	}
 }
