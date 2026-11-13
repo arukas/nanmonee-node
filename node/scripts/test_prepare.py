@@ -44,20 +44,20 @@ class PrepareTests(unittest.TestCase):
         for name in ["0001-anytls-hot-update.patch", "0002-client-hook-race.patch", "0003-session-identity-and-close-hooks.patch", "patched-files.sha256"]:
             shutil.copy2(SING_ANYTLS_PATCHES / name, sing_anytls_patches / name)
         subprocess.run(
-            ["rtk", "git", "clone", "--no-hardlinks", "--quiet", str(SING_BOX_SOURCE), str(self.sing_box)],
+            ["git", "clone", "--no-hardlinks", "--quiet", str(SING_BOX_SOURCE), str(self.sing_box)],
             check=True, capture_output=True, text=True,
         )
         subprocess.run(
-            ["rtk", "git", "clone", "--no-hardlinks", "--quiet", str(SING_QUIC_SOURCE), str(self.sing_quic)],
+            ["git", "clone", "--no-hardlinks", "--quiet", str(SING_QUIC_SOURCE), str(self.sing_quic)],
             check=True, capture_output=True, text=True,
         )
         subprocess.run(
-            ["rtk", "git", "clone", "--no-hardlinks", "--quiet", str(SING_ANYTLS_SOURCE), str(self.sing_anytls)],
+            ["git", "clone", "--no-hardlinks", "--quiet", str(SING_ANYTLS_SOURCE), str(self.sing_anytls)],
             check=True, capture_output=True, text=True,
         )
 
     def prepare(self):
-        return subprocess.run(["rtk", "proxy", "sh", str(self.script)], capture_output=True, text=True)
+        return subprocess.run(["sh", str(self.script)], capture_output=True, text=True)
 
     def assert_prepared(self):
         result = self.prepare()
@@ -73,7 +73,7 @@ class PrepareTests(unittest.TestCase):
         # a plain checkout cannot remove the added files.
         self.assert_prepared()
         subprocess.run(
-            ["rtk", "git", "-C", str(self.sing_box), "checkout", "--", "protocol/tuic/inbound.go"],
+            ["git", "-C", str(self.sing_box), "checkout", "--", "protocol/tuic/inbound.go"],
             check=True, capture_output=True, text=True,
         )
         result = self.prepare()

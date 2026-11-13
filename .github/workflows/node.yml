@@ -26,19 +26,6 @@ jobs:
         with:
           persist-credentials: false
 
-      # The node scripts prefix every command with rtk, so the pinned release is
-      # installed from the checksum recorded here rather than from a moving tag.
-      - name: Install the pinned RTK
-        env:
-          RTK_SHA256: 70fee7b4a548c43dde94c77e2335550981b0bc2fb013691d8c8109b5bd0eda37
-        run: |
-          curl -fsSL -o /tmp/rtk.tar.gz \
-            https://github.com/rtk-ai/rtk/releases/download/v1.2.0/rtk-x86_64-unknown-linux-musl.tar.gz
-          echo "${RTK_SHA256}  /tmp/rtk.tar.gz" | sha256sum -c -
-          tar -xzf /tmp/rtk.tar.gz -C /tmp rtk
-          sudo install -m 0755 /tmp/rtk /usr/local/bin/rtk
-          rtk --version
-
       # The build runs inside the fixed image. The runner toolchain is only used
       # for vet, gofmt and the test run, and must match the image's Go release.
       - name: Install Go
@@ -54,19 +41,19 @@ jobs:
 
       - name: Build the pinned artifacts
         working-directory: node
-        run: rtk ./scripts/build.sh
+        run: ./scripts/build.sh
 
       - name: Regenerate the protocol files
         working-directory: node
         run: |
-          rtk ./scripts/generate-proto.sh
-          rtk git diff --exit-code -- api/node/v1
+          ./scripts/generate-proto.sh
+          git diff --exit-code -- api/node/v1
 
       - name: Check formatting
         working-directory: node
         run: |
           # Capture explicitly: a failing toolchain must not look like "no output".
-          unformatted="$(rtk gofmt -l api cmd internal)"
+          unformatted="$(gofmt -l api cmd internal)"
           if [ -n "${unformatted}" ]; then
             echo "these files need gofmt:"
             echo "${unformatted}"
@@ -77,15 +64,15 @@ jobs:
       - name: Vet and test
         working-directory: node
         run: |
-          rtk go vet -mod=readonly -tags 'with_quic with_utls' ./...
-          rtk go test -mod=readonly -race -count=1 -p=2 -tags 'with_quic with_utls' ./...
+          go vet -mod=readonly -tags 'with_quic with_utls' ./...
+          go test -mod=readonly -race -count=1 -p=2 -tags 'with_quic with_utls' ./...
 
       - name: Test the patched kernels
         working-directory: node
-        run: rtk ./scripts/test_kernels.sh
+        run: ./scripts/test_kernels.sh
 
       - name: Test the preparation and manifest scripts
-        run: rtk python3 -m unittest discover -s node/scripts -p 'test_*.py'
+        run: python3 -m unittest discover -s node/scripts -p 'test_*.py'
 
       - name: Package the artifacts
         env:
@@ -97,11 +84,11 @@ jobs:
           install -m 0755 node/.build/nanmonee-nodectl dist/nanmonee-nodectl
           cp node/deploy/README.md dist/DEPLOY.md
           cp LICENSE dist/LICENSE
-          rtk python3 node/scripts/write_manifest.py --write dist/build-manifest.json \
+          python3 node/scripts/write_manifest.py --write dist/build-manifest.json \
             --node-commit "${GITHUB_SHA}" \
             --panel-commit "${PANEL_COMMIT}"
-          rtk python3 node/scripts/write_manifest.py --check dist/build-manifest.json
-          (cd dist && rtk shasum -a 256 nanmonee-node nanmonee-nodectl build-manifest.json DEPLOY.md LICENSE | tee SHA256SUMS)
+          python3 node/scripts/write_manifest.py --check dist/build-manifest.json
+          (cd dist && sha256sum nanmonee-node nanmonee-nodectl build-manifest.json DEPLOY.md LICENSE | tee SHA256SUMS)
 
       - name: Upload the verified artifacts
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

@@ -32,7 +32,7 @@ EXPECTED_ANYTLS=" M service.go
 ?? session/hook_test.go"
 
 normalize_status() {
-  rtk bypass git -C "$1" status --porcelain | while IFS= read -r LINE; do
+  git -C "$1" status --porcelain | while IFS= read -r LINE; do
     case "$LINE" in
       " A "*) printf '?? %s\n' "${LINE#???}" ;;
       *) printf '%s\n' "$LINE" ;;
@@ -41,11 +41,11 @@ normalize_status() {
 }
 
 apply_patch() {
-  if rtk git -C "$1" apply --check --reverse "$2" >/dev/null 2>&1; then
+  if git -C "$1" apply --check --reverse "$2" >/dev/null 2>&1; then
     return 0
   fi
-  rtk git -C "$1" apply --check "$2"
-  rtk git -C "$1" apply "$2"
+  git -C "$1" apply --check "$2"
+  git -C "$1" apply "$2"
 }
 
 # The patched trees are derived caches owned by this script, and an interrupted
@@ -63,7 +63,7 @@ recover_partial() {
   UNEXPECTED=""
   while IFS= read -r LINE; do
     [ -z "$LINE" ] && continue
-    if ! printf '%s\n' "$EXPECTED" | rtk grep -qxF -- "$LINE"; then
+    if ! printf '%s\n' "$EXPECTED" | grep -qxF -- "$LINE"; then
       UNEXPECTED="${UNEXPECTED}${LINE}
 "
     fi
@@ -76,13 +76,13 @@ EOF
     exit 1
   fi
   printf '%s cache is only partially patched, probably from an interrupted run; re-applying the fixed patches\n' "$LABEL" >&2
-  rtk git -C "$TREE" checkout -- .
-  rtk bypass git -C "$TREE" clean -fdq
+  git -C "$TREE" checkout -- .
+  git -C "$TREE" clean -fdq
 }
 
 check_checksums() {
   while read -r EXPECTED FILE; do
-    ACTUAL=$(rtk shasum -a 256 "$1/$FILE" | rtk cut -d ' ' -f1)
+    ACTUAL=$(shasum -a 256 "$1/$FILE" | cut -d ' ' -f1)
     if [ "$ACTUAL" != "$EXPECTED" ]; then
       printf 'patched file content differs from the fixed checksum: %s/%s\n' "$1" "$FILE" >&2
       exit 1
@@ -92,9 +92,9 @@ check_checksums() {
 
 # sing-box, the pinned kernel release, plus the two tracked hot-update patches.
 if [ ! -d "$SOURCE/.git" ]; then
-  rtk git clone --depth 1 --branch v1.14.4 https://github.com/SagerNet/sing-box.git "$SOURCE"
+  git clone --depth 1 --branch v1.14.4 https://github.com/SagerNet/sing-box.git "$SOURCE"
 fi
-ACTUAL=$(rtk git -C "$SOURCE" rev-parse HEAD)
+ACTUAL=$(git -C "$SOURCE" rev-parse HEAD)
 if [ "$ACTUAL" != "$COMMIT" ]; then
   printf 'unexpected sing-box commit: %s\n' "$ACTUAL" >&2
   exit 1
@@ -111,18 +111,18 @@ if [ "$(normalize_status "$SOURCE")" != "$EXPECTED_SING_BOX" ]; then
   exit 1
 fi
 check_checksums "$SOURCE" "$PATCHES/patched-files.sha256"
-rtk git -C "$SOURCE" diff --check
+git -C "$SOURCE" diff --check
 
 # sing-quic, the QUIC stack behind the Hysteria2 and TUIC inbounds. It is pinned
 # by commit instead of by version because the fixes are not part of any release
 # yet.
 if [ ! -d "$QUIC/.git" ]; then
-  rtk git init --quiet "$QUIC"
-  rtk git -C "$QUIC" remote add origin https://github.com/sagernet/sing-quic.git
-  rtk git -C "$QUIC" fetch --depth 1 origin "$QUIC_COMMIT"
-  rtk git -C "$QUIC" checkout --quiet "$QUIC_COMMIT"
+  git init --quiet "$QUIC"
+  git -C "$QUIC" remote add origin https://github.com/sagernet/sing-quic.git
+  git -C "$QUIC" fetch --depth 1 origin "$QUIC_COMMIT"
+  git -C "$QUIC" checkout --quiet "$QUIC_COMMIT"
 fi
-ACTUAL=$(rtk git -C "$QUIC" rev-parse HEAD)
+ACTUAL=$(git -C "$QUIC" rev-parse HEAD)
 if [ "$ACTUAL" != "$QUIC_COMMIT" ]; then
   printf 'unexpected sing-quic commit: %s\n' "$ACTUAL" >&2
   exit 1
@@ -137,17 +137,17 @@ if [ "$(normalize_status "$QUIC")" != "$EXPECTED_QUIC" ]; then
   exit 1
 fi
 check_checksums "$QUIC" "$QUIC_PATCHES/patched-files.sha256"
-rtk git -C "$QUIC" diff --check
+git -C "$QUIC" diff --check
 
 # sing-anytls, the session layer behind the AnyTLS inbound. It is pinned by
 # commit because the revocation fix is not part of any release yet.
 if [ ! -d "$ANYTLS/.git" ]; then
-  rtk git init --quiet "$ANYTLS"
-  rtk git -C "$ANYTLS" remote add origin https://github.com/anytls/sing-anytls.git
-  rtk git -C "$ANYTLS" fetch --depth 1 origin "$ANYTLS_COMMIT"
-  rtk git -C "$ANYTLS" checkout --quiet "$ANYTLS_COMMIT"
+  git init --quiet "$ANYTLS"
+  git -C "$ANYTLS" remote add origin https://github.com/anytls/sing-anytls.git
+  git -C "$ANYTLS" fetch --depth 1 origin "$ANYTLS_COMMIT"
+  git -C "$ANYTLS" checkout --quiet "$ANYTLS_COMMIT"
 fi
-ACTUAL=$(rtk git -C "$ANYTLS" rev-parse HEAD)
+ACTUAL=$(git -C "$ANYTLS" rev-parse HEAD)
 if [ "$ACTUAL" != "$ANYTLS_COMMIT" ]; then
   printf 'unexpected sing-anytls commit: %s\n' "$ACTUAL" >&2
   exit 1
@@ -159,9 +159,9 @@ fi
 for PATCH in 0001-anytls-hot-update.patch 0002-client-hook-race.patch 0003-session-identity-and-close-hooks.patch; do
   [ -f "$ANYTLS_PATCHES/$PATCH" ] || { printf 'missing AnyTLS patch: %s\n' "$PATCH" >&2; exit 1; }
 done
-if ! rtk git -C "$ANYTLS" apply --check --reverse "$ANYTLS_PATCHES/0003-session-identity-and-close-hooks.patch" >/dev/null 2>&1; then
-  if ! rtk git -C "$ANYTLS" apply --check --reverse "$ANYTLS_PATCHES/0002-client-hook-race.patch" >/dev/null 2>&1; then
-    if ! rtk git -C "$ANYTLS" apply --check --reverse "$ANYTLS_PATCHES/0001-anytls-hot-update.patch" >/dev/null 2>&1; then
+if ! git -C "$ANYTLS" apply --check --reverse "$ANYTLS_PATCHES/0003-session-identity-and-close-hooks.patch" >/dev/null 2>&1; then
+  if ! git -C "$ANYTLS" apply --check --reverse "$ANYTLS_PATCHES/0002-client-hook-race.patch" >/dev/null 2>&1; then
+    if ! git -C "$ANYTLS" apply --check --reverse "$ANYTLS_PATCHES/0001-anytls-hot-update.patch" >/dev/null 2>&1; then
       apply_patch "$ANYTLS" "$ANYTLS_PATCHES/0001-anytls-hot-update.patch"
     fi
     apply_patch "$ANYTLS" "$ANYTLS_PATCHES/0002-client-hook-race.patch"
@@ -173,4 +173,4 @@ if [ "$(normalize_status "$ANYTLS")" != "$EXPECTED_ANYTLS" ]; then
   exit 1
 fi
 check_checksums "$ANYTLS" "$ANYTLS_PATCHES/patched-files.sha256"
-rtk git -C "$ANYTLS" diff --check
+git -C "$ANYTLS" diff --check

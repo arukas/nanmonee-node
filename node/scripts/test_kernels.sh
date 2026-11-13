@@ -9,19 +9,19 @@ ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 IMAGE="golang@sha256:eb36c1664dd974cde625f736e02c204383deebe03977365caaec5bf49f794348"
 WORK="$ROOT/.build/kernel-tests"
 
-rtk "$ROOT/scripts/prepare.sh"
-rtk rm -rf "$WORK"
-rtk mkdir -p "$ROOT/.build"
-rtk cp -a "$ROOT/.cache/sing-box-v1.14.4" "$WORK"
+"$ROOT/scripts/prepare.sh"
+rm -rf "$WORK"
+mkdir -p "$ROOT/.build"
+cp -a "$ROOT/.cache/sing-box-v1.14.4" "$WORK"
 
-rtk docker run --rm -v "$ROOT:/src" -w /src/.build/kernel-tests \
+docker run --rm -v "$ROOT:/src" -w /src/.build/kernel-tests \
   -e GOTOOLCHAIN=local -e GOMODCACHE=/src/.cache/gomod -e GOCACHE=/src/.cache/go-build "$IMAGE" \
   sh -c 'go mod edit -replace=github.com/sagernet/sing-quic=/src/.cache/sing-quic-7e0a5869a5f4 -replace=github.com/anytls/sing-anytls=/src/.cache/sing-anytls-130d2e61b889 && go test -race -count=1 -p=2 -tags "with_quic with_utls" ./protocol/vless/ ./protocol/hysteria2/ ./protocol/anytls/ ./protocol/tuic/'
 
-rtk docker run --rm -v "$ROOT:/src" -w /src/.cache/sing-quic-7e0a5869a5f4 \
+docker run --rm -v "$ROOT:/src" -w /src/.cache/sing-quic-7e0a5869a5f4 \
   -e GOTOOLCHAIN=local -e GOMODCACHE=/src/.cache/gomod -e GOCACHE=/src/.cache/go-build "$IMAGE" \
   go test -race -count=1 -p=2 ./hysteria2/ ./tuic/
 
-rtk docker run --rm -v "$ROOT:/src" -w /src/.cache/sing-anytls-130d2e61b889 \
+docker run --rm -v "$ROOT:/src" -w /src/.cache/sing-anytls-130d2e61b889 \
   -e GOTOOLCHAIN=local -e GOMODCACHE=/src/.cache/gomod -e GOCACHE=/src/.cache/go-build "$IMAGE" \
   go test -race -count=1 -p=2 ./ ./session/
