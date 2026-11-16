@@ -15,13 +15,16 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"nanmonee/node/internal/sysinfo"
 )
 
 const (
 	// maxResponseBytes bounds every panel response we are willing to buffer.
 	maxResponseBytes = 8 << 20
-	// AgentVersion is reported to the panel and to the control plane.
-	AgentVersion = "0.10.0-n1"
+	// AgentVersion is reported to the panel and to the control plane. It is the
+	// version the updater uses to decide whether this host still needs a release.
+	AgentVersion = "0.11.0-n1"
 )
 
 // Options configures a Client. URL, Token, NodeID and NodeType are required.
@@ -554,6 +557,35 @@ func (c *Client) ReportTrafficBatch(ctx context.Context, batch TrafficBatch) err
 	if ack.Protocol != TrafficProtocol || ack.BatchID != batch.BatchID {
 		return fmt.Errorf("%w: the panel acknowledged a different batch", ErrTransient)
 	}
+	return nil
+}
+
+// ReportSystemStatus publishes one sysinfo sample. The document is the
+// collector's own snapshot type: defining the wire shape twice would let the two
+// definitions drift, and the panel validates every field anyway.
+//
+// A failure is returned to the caller, which records it without disturbing
+// traffic reporting: a host that cannot be described must keep proxying.
+func (c *Client) ReportSystemStatus(ctx context.Context, report sysinfo.Snapshot) error {
+	payload, err := json.Marshal(report)
+	if err != nil {
+		return err
+	}
+	response, err := c.do(ctx, http.MethodPost, "/api/node/v1/system", nil, payload, "")
+	if err != nil {
+		return err
+	}
+	var ack struct {
+		Accepted *bool  `json:"accepted"`
+		Reason   string `json:"reason"`
+	}
+	if err := decodeStrict(response, &ack); err != nil {
+		return err
+	}
+	if ack.Accepted == nil {
+		return fmt.Errorf("%w: the panel did not acknowledge the system report", ErrTransient)
+	}
+	// A stale sample is not a failure: another report superseded this one.
 	return nil
 }
 

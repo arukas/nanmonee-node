@@ -80,6 +80,49 @@ install -m 0440 -o root -g nanmonee-node privkey.pem   /etc/nanmonee-node/tls/pr
 - 配置缺失、不是普通文件或 group/other 权限位非零时，进程以可读错误退出，单元不会进入 active。
 - 卸载一个节点：`systemctl disable --now nanmonee-node@12`，删除 `/etc/nanmonee-node/nodes/12.json` 与 `/var/lib/nanmonee-node/12`。删除共享二进制/用户前先确认没有其他实例。
 
+## 系统信息上报与自升级（0.11.0）
+
+agent 每 60 秒向面板 `POST /api/node/v1/system` 上报一次主机信息（系统/内核/架构/虚拟化、CPU 型号与核心数、内存与 Swap、CPU 使用率与负载、磁盘用量、进程 RSS/线程数），协议为 `nanmonee-sysinfo-v1`。采集失败只降级对应字段，不影响代理与计量。
+
+升级是一件独立的 root 侧程序，不在 agent 内：
+
+| 项目 | 路径 |
+| --- | --- |
+| 升级器二进制 | `/opt/nanmonee-node/current/bin/nanmonee-node-updater` |
+| 配置 | `/etc/nanmonee-node/updater.json`，`root:root`、`0400` |
+| 单元 | `nanmonee-node-updater.service`（oneshot）与 `nanmonee-node-updater.timer`（5 分钟） |
+| 暂存 | `releases/.<version>.incoming-*`，校验通过后整体改名为 `releases/<version>` |
+
+配置只有六个字段，多一个或少一个都会拒绝启动：
+
+```json
+{
+  "panel_url": "https://nanmonee.example.com",
+  "vps_id": 1,
+  "token": "<64 位十六进制>",
+  "release_dir": "/opt/nanmonee-node",
+  "state_dir": "/var/lib/nanmonee-node-updater",
+  "timeout_seconds": 120
+}
+```
+
+面板「VPS 详情 → 下载升级器安装脚本」会生成带该 VPS 令牌的脚本：安装单元 → 写入 0400 配置 → 启用并启动 timer。令牌只在脚本里出现一次，面板只存 SHA-256；重新下载会轮换，旧令牌立即失效。
+
+升级流程：向 `/api/vps/updater/v1/check` 上报当前版本 → 面板返回 `noop`（无可执行请求）或 `install`（版本号、逐产物 `url`+`sha256`、需要重启的 `nanmonee-node@<id>.service` 列表）→ 下载并校验 SHA-256 与 ELF 类型/架构 → 改名发布 → 原子切换 `current` → 逐个重启并做健康检查。任一步失败即切回上一版本、重启已重启过的实例，并在下一次轮询回报 `failed` 与原因。升级器只会 `systemctl restart nanmonee-node@<数字>.service`，其他 unit 名字直接拒绝。
+
+排障：
+
+```sh
+systemctl status nanmonee-node-updater.service
+systemctl list-timers nanmonee-node-updater.timer
+journalctl -u nanmonee-node-updater -n 100
+readlink -f /opt/nanmonee-node/current
+```
+
+手动跑一次：`systemctl start nanmonee-node-updater.service`。它会立即取指令；没有请求时输出 `noop` 并成功退出。**不要**在面板登记请求后手改 `current`，否则面板记录与主机实际版本会分叉。
+
+如果升级后单元起不来、日志是 `Changing to the requested working directory failed: Permission denied`，先看权限：升级器单元带 `UMask=0077`，`releases/`、`releases/<version>/`、`bin/` 和三个产物都必须是 `0755`，否则以 `nanmonee-node` 用户运行的节点既进不去目录也执行不了二进制。当前版本已在写入后显式 `chmod`，不需要手工修；遇到旧版本留下的目录可以 `chmod -R a+rX /opt/nanmonee-node/releases/<version>` 应急。
+
 ## 与旧协议实例的关系
 
 旧生产实例按协议命名（`nanmonee-node.service`、`nanmonee-node-hysteria2.service` 等），使用 `/etc/nanmonee-node/<protocol>.json` 和协议级状态目录。N1-2 不改动这些运行中的单元；N1-4 破坏性重建时再停用并替换为按节点 ID 的实例。

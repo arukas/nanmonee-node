@@ -12,6 +12,7 @@ import (
 	"nanmonee/node/internal/panel"
 	"nanmonee/node/internal/probe"
 	noderuntime "nanmonee/node/internal/runtime"
+	"nanmonee/node/internal/sysinfo"
 	"nanmonee/node/internal/traffic"
 )
 
@@ -31,6 +32,10 @@ const (
 	// probeConcurrency bounds simultaneous measurements so a long target list
 	// cannot open an unbounded number of sockets.
 	probeConcurrency = 4
+	// systemReportInterval is how often the host's configuration and resource
+	// usage are published. It is slower than the traffic push because host load
+	// changes on a scale an operator reads, not bills against.
+	systemReportInterval = 60 * time.Second
 )
 
 // Observer exposes the worker's own view for the control plane status message.
@@ -80,6 +85,10 @@ type Worker struct {
 	// Cache the last fetched config and users; apply only after both pulls succeed.
 	pendingConfig noderuntime.Config
 	pendingUsers  []noderuntime.User
+
+	// sysinfo carries the previous CPU counters, so every report is a rate over
+	// the interval since the last one rather than an average since boot.
+	sysinfo *sysinfo.Collector
 }
 
 // Options configures a Worker.
@@ -102,6 +111,7 @@ func New(options Options) (*Worker, error) {
 		pullInterval:   DefaultPullInterval,
 		pushInterval:   DefaultPushInterval,
 		sampleInterval: DefaultSampleInterval,
+		sysinfo:        sysinfo.New(panel.AgentVersion, panel.KernelVersion, panel.KernelCommit),
 	}, nil
 }
 
@@ -152,6 +162,11 @@ func (w *Worker) Run(ctx context.Context) error {
 	// against the last run rather than by a ticker each.
 	probe := time.NewTicker(probeTickInterval)
 	defer probe.Stop()
+	// The first system report goes out immediately: an operator who deploys a
+	// node should not wait a full interval to see the host.
+	system := time.NewTicker(systemReportInterval)
+	defer system.Stop()
+	_ = w.reportSystem(ctx)
 
 	for {
 		select {
@@ -166,6 +181,9 @@ func (w *Worker) Run(ctx context.Context) error {
 		case <-probe.C:
 			// A probe failure must never disturb traffic reporting.
 			_ = w.runProbes(ctx)
+		case <-system.C:
+			// A host description failure must never disturb traffic reporting.
+			_ = w.reportSystem(ctx)
 		case <-push.C:
 			_ = w.collect(ctx, true)
 		}
@@ -529,6 +547,24 @@ func (w *Worker) runProbes(ctx context.Context) error {
 	defer cancel()
 	if err := w.client.ReportProbeSamples(requestCtx, panel.ProbeSamples{Results: results}); err != nil {
 		w.setError(err)
+		return err
+	}
+
+	return nil
+}
+
+// reportSystem publishes one sysinfo sample. It is the only caller of the
+// collector, so the CPU rate always spans a real interval.
+func (w *Worker) reportSystem(ctx context.Context) error {
+	snapshot := w.sysinfo.Sample()
+
+	requestCtx, cancel := context.WithTimeout(ctx, requestTimeout)
+	defer cancel()
+	if err := w.client.ReportSystemStatus(requestCtx, snapshot); err != nil {
+		// Keep the traffic path untouched: a rejected host description is worth a
+		// log line, never an outage.
+		w.setError(err)
+		log.Printf("system report not accepted: %v", err)
 		return err
 	}
 

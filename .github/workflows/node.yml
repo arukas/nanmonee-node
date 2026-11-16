@@ -82,13 +82,14 @@ jobs:
           mkdir -p dist
           install -m 0755 node/.build/nanmonee-node dist/nanmonee-node
           install -m 0755 node/.build/nanmonee-nodectl dist/nanmonee-nodectl
+          install -m 0755 node/.build/nanmonee-node-updater dist/nanmonee-node-updater
           cp node/deploy/README.md dist/DEPLOY.md
           cp LICENSE dist/LICENSE
           python3 node/scripts/write_manifest.py --write dist/build-manifest.json \
             --node-commit "${GITHUB_SHA}" \
             --panel-commit "${PANEL_COMMIT}"
           python3 node/scripts/write_manifest.py --check dist/build-manifest.json
-          (cd dist && sha256sum nanmonee-node nanmonee-nodectl build-manifest.json DEPLOY.md LICENSE | tee SHA256SUMS)
+          (cd dist && sha256sum nanmonee-node nanmonee-nodectl nanmonee-node-updater build-manifest.json DEPLOY.md LICENSE | tee SHA256SUMS)
 
       - name: Upload the verified artifacts
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -134,4 +135,5 @@ jobs:
             --prerelease \
             --title "nanmonee-node ${TAG}" \
             --notes "Artifacts built and verified by ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID} from ${GITHUB_SHA}." \
-            dist/nanmonee-node dist/nanmonee-nodectl dist/build-manifest.json dist/DEPLOY.md dist/LICENSE dist/SHA256SUMS
+            dist/nanmonee-node dist/nanmonee-nodectl dist/nanmonee-node-updater \
+            dist/build-manifest.json dist/DEPLOY.md dist/LICENSE dist/SHA256SUMS

@@ -61,8 +61,9 @@ PANEL_ROLE = "migration-origin"
 ARTIFACTS = (
     ("node/.build/nanmonee-node", "nanmonee-node"),
     ("node/.build/nanmonee-nodectl", "nanmonee-nodectl"),
+    ("node/.build/nanmonee-node-updater", "nanmonee-node-updater"),
 )
-AGENT_VERSION = "0.10.0-n1"
+AGENT_VERSION = "0.11.0-n1"
 TOOLCHAIN = {
     "go": "1.26.8",
     "docker_image": "golang@sha256:eb36c1664dd974cde625f736e02c204383deebe03977365caaec5bf49f794348",
