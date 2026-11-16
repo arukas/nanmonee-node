@@ -85,12 +85,32 @@ func TestLoadRejectsUnknownFieldsAndBadIdentity(t *testing.T) {
 	tests := map[string]func() string{
 		"unknown field": func() string {
 			path := writeConfig(t, base, 0o400)
-			content, _ := os.ReadFile(path)
+			content, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatalf("read config: %v", err)
+			}
 			var document map[string]any
-			_ = json.Unmarshal(content, &document)
+			if err := json.Unmarshal(content, &document); err != nil {
+				t.Fatalf("unmarshal config: %v", err)
+			}
 			document["extra"] = true
-			updated, _ := json.Marshal(document)
-			_ = os.WriteFile(path, updated, 0o400)
+			updated, err := json.Marshal(document)
+			if err != nil {
+				t.Fatalf("marshal config: %v", err)
+			}
+			// The file is already 0400: rewriting it in place fails with EACCES
+			// for anyone but root, and the ignored error left the valid config
+			// untouched, so the test asserted nothing about unknown fields.
+			// Remove it first and create the tampered copy instead.
+			if err := os.Remove(path); err != nil {
+				t.Fatalf("remove config: %v", err)
+			}
+			if err := os.WriteFile(path, updated, 0o400); err != nil {
+				t.Fatalf("write tampered config: %v", err)
+			}
+			if err := os.Chmod(path, 0o400); err != nil {
+				t.Fatalf("chmod tampered config: %v", err)
+			}
 
 			return path
 		},
